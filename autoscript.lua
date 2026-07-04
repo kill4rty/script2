@@ -3,8 +3,9 @@
     Local server only.
 --]]
 
-local Players  = game:GetService("Players")
-local CS       = game:GetService("CollectionService")
+local Players    = game:GetService("Players")
+local CS         = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
@@ -16,42 +17,73 @@ local CharWrapperClient  = Fsys("CharWrapperClient")
 local StateManagerClient = Fsys("StateManagerClient")
 
 -- ============================================================
--- NO-RENDER: kill the 3D viewport to save CPU on a GPU-less host.
--- Game logic / remotes keep working; nothing gets drawn.
+-- CONFIG: flip DISABLE_RENDER to false if the farm can't find
+-- furniture (keeps rendering on so the world loads normally).
 -- ============================================================
-local RunService = game:GetService("RunService")
-pcall(function() RunService:Set3dRenderingEnabled(false) end)
-pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
-pcall(function()
-    local Lighting = game:GetService("Lighting")
-    Lighting.GlobalShadows = false
-    Lighting.FogEnd = 9e9
-    for _, e in ipairs(Lighting:GetChildren()) do
-        if e:IsA("PostEffect") then e.Enabled = false end
-    end
-end)
--- Re-assert 3D-off shortly after join, in case the game re-enables it on spawn.
-task.spawn(function()
-    for _ = 1, 5 do
-        task.wait(2)
-        pcall(function() RunService:Set3dRenderingEnabled(false) end)
-    end
-end)
+local DISABLE_RENDER = true
+
+-- Forward declarations so sendStatus (defined below) can reach these;
+-- they get assigned further down once the GUI / farm / egg logic is built.
+local startFarm, stopFarm, startEgg, stopEgg
+local usernameBox, totalEggsBox, startTradeBtn
 
 -- ============================================================
--- AUTO JOIN: dismiss NewsApp + spawn at home on load
+-- AUTO JOIN: wait for load -> choose team -> spawn home ->
+-- hide menu GUI -> then kill rendering (deferred until in-game)
 -- ============================================================
 task.spawn(function()
-    task.wait(3)
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    local t = 0
+    while not LocalPlayer.Character and t < 20 do task.wait(0.5); t = t + 0.5 end
+    task.wait(2)
+
+    -- dismiss news, choose Babies team, spawn at home (retry a few times)
+    for _ = 1, 5 do
+        pcall(function() RouterClient.get("MainMenuAPI/ViewedNews"):FireServer() end)
+        task.wait(0.3)
+        pcall(function()
+            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies", {
+                dont_send_back_home = false, source_for_logging = "autoscript"
+            })
+        end)
+        task.wait(0.3)
+        pcall(function()
+            RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autoscript" })
+        end)
+        task.wait(1)
+    end
+
+    -- best-effort: hide leftover main-menu / play / news GUIs (skips our own)
     pcall(function()
-        RouterClient.get("MainMenuAPI/ViewedNews"):FireServer()
+        for _, g in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
+            if g:IsA("ScreenGui") and g.Name ~= "AutoScriptGui" then
+                local n = g.Name:lower()
+                if n:find("menu") or n:find("play") or n:find("title") or n:find("news") then
+                    g.Enabled = false
+                end
+            end
+        end
     end)
-    task.wait(0.5)
-    pcall(function()
-        RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", {
-            source_for_logging = "autoscript"
-        })
-    end)
+
+    -- now that we're in-game, kill rendering to save CPU (GPU-less host)
+    if DISABLE_RENDER then
+        pcall(function() RunService:Set3dRenderingEnabled(false) end)
+        pcall(function()
+            UserSettings():GetService("UserGameSettings").SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
+        end)
+        pcall(function()
+            local Lighting = game:GetService("Lighting")
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 9e9
+            for _, e in ipairs(Lighting:GetChildren()) do
+                if e:IsA("PostEffect") then e.Enabled = false end
+            end
+        end)
+        for _ = 1, 5 do
+            task.wait(2)
+            pcall(function() RunService:Set3dRenderingEnabled(false) end)
+        end
+    end
 end)
 
 -- ============================================================
@@ -403,6 +435,21 @@ local function claimPetPen()
     RouterClient.get("IdleProgressionAPI/CommitAllProgression"):FireServer()
 end
 
+-- Fire a remote, trying InvokeServer first then FireServer, all pcall-safe.
+local function tryRemote(name)
+    if not pcall(function() RouterClient.get(name):InvokeServer() end) then
+        pcall(function() RouterClient.get(name):FireServer() end)
+    end
+end
+
+-- Claims daily rewards + cashout/deliveries. Names verified from the RS dump.
+local function claimExtras()
+    tryRemote("DailyLoginAPI/ClaimDailyReward")
+    tryRemote("DailyLoginAPI/ClaimStarReward")
+    tryRemote("HousingAPI/ClaimAllDeliveries")
+    tryRemote("LootBoxAPI/ClaimLoginHandouts")
+end
+
 local function fillPetPen()
     local penData = ClientData.get("idle_progression") or {}
     local activePets = penData.active_pets or {}
@@ -450,18 +497,13 @@ local eggBuying = false
 -- WEBHOOK CONFIG
 -- ============================================================
 local SERVER_URL     = "http://152.53.144.174:5000"
-local INSTANCE_ID    = "instance_1"
+local INSTANCE_ID    = LocalPlayer.Name  -- unique per instance (the account name)
 local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135" -- must match WEBHOOK_SECRET on the server
 
 local HttpService = game:GetService("HttpService")
 
 local currentMode   = "idle"
 local currentStatus = "idle"
-
--- Forward declarations so sendStatus (below) can see these; they are
--- actually assigned further down once the GUI / farm / egg logic is built.
-local startFarm, stopFarm, startEgg, stopEgg
-local usernameBox, totalEggsBox, startTradeBtn
 
 local function getEggCounts()
     local inventory = ClientData.get("inventory") or {}
@@ -525,7 +567,7 @@ end
 
 task.spawn(function()
     while true do
-        task.wait(30)
+        task.wait(5)
         pcall(sendStatus)
     end
 end)
@@ -902,12 +944,19 @@ function startFarm()
     fillPetPen()
     claimPetPen()
     claimMoneyTree()
+    claimExtras()
+    local loopCount = 0
     farmThread = task.spawn(function()
         while farming do
+            loopCount = loopCount + 1
+            if loopCount % 60 == 0 then pcall(claimExtras) end   -- cashout/daily ~every 30s
             local char = LocalPlayer.Character
             local root = char and char:FindFirstChild("HumanoidRootPart")
             if root then
                 ensureInHouse(setFarmStatus)
+                -- force the house furniture to stream in even with rendering off
+                pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
+                task.wait(0.2)
                 claimPetPen()
                 fillPetPen()
                 claimMoneyTree()
