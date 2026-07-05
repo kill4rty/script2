@@ -140,17 +140,9 @@ task.spawn(function()
         end
     end)
 
-    -- keep rendering ON (so the house streams/loads) but pin lowest detail
-    applyLowDetail()
-    if DISABLE_RENDER then
-        task.spawn(function()
-            while true do
-                pcall(function() RunService:Set3dRenderingEnabled(false) end)
-                task.wait(5)
-            end
-        end)
-    end
-end)
+    -- leave rendering alone; just make sure it's ON (undo any prior disable)
+    pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    end)
 
 -- ============================================================
 -- TRADE CONFIG
