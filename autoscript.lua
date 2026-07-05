@@ -1,6 +1,7 @@
 --[[
     AutoScript - Combined AutoTrade + AutoFarm + AutoEgg GUI
     Local server only. Debug reporting + control-panel toggle.
+    LOW-DETAIL render mode: world loads, cheapest quality.
 --]]
 
 local Players    = game:GetService("Players")
@@ -19,8 +20,11 @@ local StateManagerClient = Fsys("StateManagerClient")
 
 -- ============================================================
 -- CONFIG
+-- DISABLE_RENDER=false -> keep rendering ON at lowest detail so the
+--   world/house streams and loads (farm can enter + find furniture).
+-- DISABLE_RENDER=true  -> fully kill 3D (lighter, but world won't load).
 -- ============================================================
-local DISABLE_RENDER = true          -- set false if farm can't find furniture
+local DISABLE_RENDER = false
 local SERVER_URL     = "http://152.53.144.174:5000"
 local INSTANCE_ID    = LocalPlayer.Name
 local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
@@ -35,9 +39,9 @@ local usernameBox, totalEggsBox, startTradeBtn
 local farming, trading, eggBuying = false, false, false
 local currentMode   = "idle"
 local currentStatus = "idle"
-local debugEnabled  = false          -- toggled from the control panel
+local debugEnabled  = false
 local lastError     = ""
-local dbgFurniture  = -1              -- furniture models seen last farm loop
+local dbgFurniture  = -1
 local dbgInHouse    = false
 local eggBoughtCount = 0
 
@@ -75,8 +79,25 @@ local function isInHouse()
     return loc ~= nil and loc.destination_id == "housing"
 end
 
+-- Apply cheapest render settings (keeps world loading, minimal CPU).
+local function applyLowDetail()
+    pcall(function()
+        UserSettings():GetService("UserGameSettings").SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
+    end)
+    pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+    pcall(function()
+        local Lighting = game:GetService("Lighting")
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 9e9
+        Lighting.Brightness = 0
+        for _, e in ipairs(Lighting:GetChildren()) do
+            if e:IsA("PostEffect") then e.Enabled = false end
+        end
+    end)
+end
+
 -- ============================================================
--- AUTO JOIN: retry-until-spawned (slow env), hide menu, then render-off
+-- AUTO JOIN: retry-until-spawned (slow env), hide menu, low detail
 -- ============================================================
 task.spawn(function()
     if not game:IsLoaded() then game.Loaded:Wait() end
@@ -87,7 +108,6 @@ task.spawn(function()
         end
     end
 
-    -- dismiss any blocking popups + choose team + spawn, retrying up to 3 min
     retryUntil(function()
         menuFire("MainMenuAPI/AcceptTermsOfServiceAndPrivacyPolicy")
         menuFire("MainMenuAPI/ViewedNews")
@@ -106,11 +126,9 @@ task.spawn(function()
         return LocalPlayer.Character ~= nil
     end, 180, 4)
 
-    -- make sure the character body is really there
     if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
     task.wait(2)
 
-    -- hide leftover menu / play / news GUIs (skip our own)
     pcall(function()
         for _, g in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
             if g:IsA("ScreenGui") and g.Name ~= "AutoScriptGui" then
@@ -122,20 +140,9 @@ task.spawn(function()
         end
     end)
 
-    -- kill rendering AFTER we're in-game, and keep re-asserting (game re-enables
-    -- it on spawn/teleport). Persistent low-cost loop for the GPU-less host.
+    -- keep rendering ON (so the house streams/loads) but pin lowest detail
+    applyLowDetail()
     if DISABLE_RENDER then
-        pcall(function()
-            UserSettings():GetService("UserGameSettings").SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
-        end)
-        pcall(function()
-            local Lighting = game:GetService("Lighting")
-            Lighting.GlobalShadows = false
-            Lighting.FogEnd = 9e9
-            for _, e in ipairs(Lighting:GetChildren()) do
-                if e:IsA("PostEffect") then e.Enabled = false end
-            end
-        end)
         task.spawn(function()
             while true do
                 pcall(function() RunService:Set3dRenderingEnabled(false) end)
@@ -167,7 +174,7 @@ local selectedEggIndex = 1
 local FARM_LOOP_INTERVAL = 0.5
 local FARM_TP_OFFSET     = Vector3.new(0, 4, 0)
 local FARM_USE_WAIT      = 0.3
-local HOUSE_TIMEOUT      = 180   -- generous: slow containers load ~2 min
+local HOUSE_TIMEOUT      = 180
 
 local AILMENT_USE_ID_FALLBACK = {
     ["toilet"]  = "ailments_refresh_2024_litter_box",
@@ -439,14 +446,12 @@ local function claimPetPen()
     RouterClient.get("IdleProgressionAPI/CommitAllProgression"):FireServer()
 end
 
--- Fire a remote trying InvokeServer then FireServer, all pcall-safe.
 local function tryRemote(name)
     if not pcall(function() RouterClient.get(name):InvokeServer() end) then
         pcall(function() RouterClient.get(name):FireServer() end)
     end
 end
 
--- Claims daily rewards + deliveries + handouts (names from the RS dump).
 local function claimExtras()
     tryRemote("DailyLoginAPI/ClaimDailyReward")
     tryRemote("DailyLoginAPI/ClaimStarReward")
@@ -523,16 +528,13 @@ local function buildDebug()
     local root = char and char:FindFirstChild("HumanoidRootPart")
     local pos = root and string.format("%.0f, %.0f, %.0f", root.Position.X, root.Position.Y, root.Position.Z) or "none"
     return {
-        -- spawn / join
         team       = tostring(ClientData.get("team")),
         has_char   = char ~= nil,
         char_pos   = pos,
-        -- farm state
         in_house   = dbgInHouse,
         furniture  = dbgFurniture,
         task       = currentStatus,
         egg_bought = eggBoughtCount,
-        -- errors / progress
         last_error = lastError,
     }
 end
@@ -551,7 +553,6 @@ local function sendStatus()
             error       = lastError,
         }
         if debugEnabled then body.debug = buildDebug() end
-
         local response = HttpService:RequestAsync({
             Url = SERVER_URL .. "/update",
             Method = "POST",
@@ -606,7 +607,6 @@ local function ensureInHouse(setFarmStatus)
                 InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer })
             end)
         end
-        -- fallback: physically walk through our own door
         local char     = LocalPlayer.Character
         local root     = char and char:FindFirstChild("HumanoidRootPart")
         local humanoid = char and char:FindFirstChild("Humanoid")
