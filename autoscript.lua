@@ -328,15 +328,29 @@ local function activateFurniture(entry)
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return false end
     local model = entry.model
-    local unique = model:GetAttribute("furniture_unique") or entry.unique
-    if not unique then return false end
+    if not model then return false end
+    -- find a use-block / any part to stand at
     local useBlocks = model:FindFirstChild("UseBlocks")
-    local useBlock = useBlocks and useBlocks:FindFirstChildWhichIsA("BasePart")
+    local useBlock = (useBlocks and useBlocks:FindFirstChildWhichIsA("BasePart"))
         or model:FindFirstChild("UseBlock", true)
+        or model.PrimaryPart
         or model:FindFirstChildWhichIsA("BasePart")
     if not useBlock then return false end
+    -- teleport to the furniture FIRST (so the baby actually goes there)
     root.CFrame = CFrame.new(useBlock.Position + FARM_TP_OFFSET)
     task.wait(FARM_USE_WAIT)
+    -- unique id under whatever attribute this game uses
+    local unique = entry.unique
+        or model:GetAttribute("furniture_unique")
+        or model:GetAttribute("unique")
+        or model:GetAttribute("id")
+        or model:GetAttribute("furniture_id")
+    if not unique then
+        for k, v in pairs(model:GetAttributes()) do
+            if type(v) == "string" and #v >= 8 then unique = v; break end
+        end
+    end
+    if not unique then return false end
     local payload = { cframe = useBlock.CFrame * CFrame.new(0, useBlock.Size.Y / 2, 0) }
     local owner = entry.player or getHouseOwner()
     local petChar = getPetChar() or char
