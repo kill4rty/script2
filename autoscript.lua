@@ -553,6 +553,12 @@ end)
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return end
     setFarmStatus("Going to house...")
+    -- recover from the void: respawn home to get back to a known spot first
+    pcall(function()
+        RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autofarm" })
+    end)
+    task.wait(3)
+    if isInHouse() then setFarmStatus("In house!"); return end
     local ok, InteriorsM = pcall(Fsys, "InteriorsM")
     if ok and InteriorsM then
         local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
