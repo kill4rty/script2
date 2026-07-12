@@ -382,7 +382,11 @@ local function activateFurniture(entry)
     local payload = { cframe = useBlock.CFrame * CFrame.new(0, useBlock.Size.Y / 2, 0) }
     local owner = entry.player or getHouseOwner()
     local petChar = getPetChar() or char
-    RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useBlock.Name, payload, petChar)
+    task.spawn(function()
+        pcall(function()
+            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useBlock.Name, payload, petChar)
+        end)
+    end)
     return true, tostring(unique)
 end
 
