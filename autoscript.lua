@@ -1,10 +1,11 @@
 --[[
     AutoScript - Combined AutoTrade + AutoFarm + AutoEgg GUI
-    Local server only. No rendering manipulation.
+    Local server only. Debug + control-panel toggle. No rendering code.
 --]]
 
 local Players    = game:GetService("Players")
 local CS         = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
@@ -15,22 +16,58 @@ local EquippedPets       = Fsys("EquippedPets")
 local CharWrapperClient  = Fsys("CharWrapperClient")
 local StateManagerClient = Fsys("StateManagerClient")
 
--- Forward declarations so sendStatus (defined below) can reach these;
--- they get assigned further down once the GUI / farm / egg logic is built.
+-- ============================================================
+-- CONFIG
+-- ============================================================
+local SERVER_URL     = "http://152.53.144.174:5000"
+local INSTANCE_ID    = LocalPlayer.Name
+local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
+
 local startFarm, stopFarm, startEgg, stopEgg
 local usernameBox, totalEggsBox, startTradeBtn
 
 -- ============================================================
+-- SHARED STATE / DEBUG
+-- ============================================================
+local farming, trading, eggBuying = false, false, false
+local currentMode   = "idle"
+local currentStatus = "idle"
+local debugEnabled  = false
+local lastError     = ""
+local dbgFurniture  = -1
+local dbgInHouse    = false
+local eggBoughtCount = 0
+
+local function logErr(where, err)
+    lastError = tostring(where) .. ": " .. tostring(err):sub(1, 140)
+end
+
+local function countFurniture()
+    local okF, FMT = pcall(Fsys, "FurnitureModelTracker")
+    if okF and FMT then
+        local models = FMT.get_furniture_models_list()
+        if models then local n = 0; for _ in pairs(models) do n = n + 1 end; return n end
+    end
+    return 0
+end
+
+local function isInHouse()
+    local ok, InteriorsM = pcall(Fsys, "InteriorsM")
+    if not ok or not InteriorsM then return false end
+    local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
+    return loc ~= nil and loc.destination_id == "housing"
+end
+
+-- ============================================================
 -- AUTO JOIN: wait for load -> choose team -> spawn home -> hide menu GUI
+-- (no rendering manipulation)
 -- ============================================================
 task.spawn(function()
     if not game:IsLoaded() then game.Loaded:Wait() end
     local t = 0
-    while not LocalPlayer.Character and t < 20 do task.wait(0.5); t = t + 0.5 end
+    while not LocalPlayer.Character and t < 40 do task.wait(0.5); t = t + 0.5 end
     task.wait(2)
-
-    -- dismiss news, choose Babies team, spawn at home (retry a few times)
-    for _ = 1, 5 do
+    for _ = 1, 6 do
         pcall(function() RouterClient.get("MainMenuAPI/ViewedNews"):FireServer() end)
         task.wait(0.3)
         pcall(function()
@@ -42,10 +79,9 @@ task.spawn(function()
         pcall(function()
             RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autoscript" })
         end)
+        if LocalPlayer.Character then break end
         task.wait(1)
     end
-
-    -- best-effort: hide leftover main-menu / play / news GUIs (skips our own)
     pcall(function()
         for _, g in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
             if g:IsA("ScreenGui") and g.Name ~= "AutoScriptGui" then
@@ -80,6 +116,7 @@ local selectedEggIndex = 1
 local FARM_LOOP_INTERVAL = 0.5
 local FARM_TP_OFFSET     = Vector3.new(0, 4, 0)
 local FARM_USE_WAIT      = 0.3
+local MONEYTREE_EVERY    = 600   -- loops (~5 min at 0.5s)
 
 local AILMENT_USE_ID_FALLBACK = {
     ["toilet"]  = "ailments_refresh_2024_litter_box",
@@ -92,7 +129,6 @@ local AILMENT_USE_ID_FALLBACK = {
 
 local AILMENT_MOVEMENT = { ["walk"] = true, ["play"] = true, ["pet_me"] = true }
 
--- Ailments we skip entirely (game handles them automatically)
 local AILMENT_SKIP = {
     ["journey_2026_truck_repair"] = true, ["at_work"] = true, ["salon"] = true,
     ["school"] = true, ["beach_party"] = true, ["camping"] = true,
@@ -298,13 +334,6 @@ local function getHouseOwner()
     return LocalPlayer
 end
 
-local function isInHouse()
-    local ok, InteriorsM = pcall(Fsys, "InteriorsM")
-    if not ok or not InteriorsM then return false end
-    local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
-    return loc ~= nil and loc.destination_id == "housing"
-end
-
 local function getHouseDoor()
     local houseExteriors = workspace:FindFirstChild("HouseExteriors")
     if houseExteriors then
@@ -323,39 +352,38 @@ local function getHouseDoor()
     return nil
 end
 
+-- Robust: teleport to the furniture FIRST (so the baby actually moves), then
+-- fire ActivateFurniture using whatever attribute holds the unique id.
 local function activateFurniture(entry)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return false end
+    if not root then return false, "no root" end
     local model = entry.model
-    if not model then return false end
-    -- find a use-block / any part to stand at
+    if not model then return false, "no model" end
     local useBlocks = model:FindFirstChild("UseBlocks")
     local useBlock = (useBlocks and useBlocks:FindFirstChildWhichIsA("BasePart"))
         or model:FindFirstChild("UseBlock", true)
         or model.PrimaryPart
         or model:FindFirstChildWhichIsA("BasePart")
-    if not useBlock then return false end
-    -- teleport to the furniture FIRST (so the baby actually goes there)
+    if not useBlock then return false, "no useBlock" end
     root.CFrame = CFrame.new(useBlock.Position + FARM_TP_OFFSET)
     task.wait(FARM_USE_WAIT)
-    -- unique id under whatever attribute this game uses
     local unique = entry.unique
         or model:GetAttribute("furniture_unique")
         or model:GetAttribute("unique")
         or model:GetAttribute("id")
         or model:GetAttribute("furniture_id")
     if not unique then
-        for k, v in pairs(model:GetAttributes()) do
+        for _, v in pairs(model:GetAttributes()) do
             if type(v) == "string" and #v >= 8 then unique = v; break end
         end
     end
-    if not unique then return false end
+    if not unique then return false, "no unique" end
     local payload = { cframe = useBlock.CFrame * CFrame.new(0, useBlock.Size.Y / 2, 0) }
     local owner = entry.player or getHouseOwner()
     local petChar = getPetChar() or char
     RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useBlock.Name, payload, petChar)
-    return true
+    return true, tostring(unique)
 end
 
 local function becomeBaby()
@@ -426,7 +454,7 @@ local function claimMoneyTree()
 end
 
 -- ============================================================
--- PAYOUT: auto-collect the timed "10 bucks" popup, independent of farm
+-- PAYOUT: auto-collect the timed "10 bucks" popup
 -- ============================================================
 task.spawn(function()
     while true do
@@ -437,26 +465,12 @@ task.spawn(function()
     end
 end)
 
-local farming   = false
-local trading   = false
-local eggBuying = false
-
 -- ============================================================
--- WEBHOOK CONFIG
+-- STATUS / DEBUG REPORTING
 -- ============================================================
-local SERVER_URL     = "http://152.53.144.174:5000"
-local INSTANCE_ID    = LocalPlayer.Name
-local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
-
-local HttpService = game:GetService("HttpService")
-
-local currentMode   = "idle"
-local currentStatus = "idle"
-
 local function getEggCounts()
     local inventory = ClientData.get("inventory") or {}
-    local counts = {}
-    local pets = inventory.pets or {}
+    local counts, pets = {}, inventory.pets or {}
     for _, item in pairs(pets) do
         if item.kind and item.kind:find("egg") then
             counts[item.kind] = (counts[item.kind] or 0) + 1
@@ -465,24 +479,41 @@ local function getEggCounts()
     return counts
 end
 
+local function buildDebug()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local pos = root and string.format("%.0f, %.0f, %.0f", root.Position.X, root.Position.Y, root.Position.Z) or "none"
+    return {
+        team = tostring(ClientData.get("team")),
+        has_char = char ~= nil,
+        char_pos = pos,
+        in_house = dbgInHouse,
+        furniture = dbgFurniture,
+        task = currentStatus,
+        egg_bought = eggBoughtCount,
+        last_error = lastError,
+    }
+end
+
 local function sendStatus()
-    local bucks = ClientData.get("money") or 0
-    local eggs  = getEggCounts()
     pcall(function()
+        local body = {
+            instance_id = INSTANCE_ID,
+            secret      = WEBHOOK_SECRET,
+            username    = LocalPlayer.Name,
+            job_id      = game.JobId,
+            bucks       = ClientData.get("money") or 0,
+            eggs        = getEggCounts(),
+            status      = currentStatus,
+            mode        = currentMode,
+            error       = lastError,
+        }
+        if debugEnabled then body.debug = buildDebug() end
         local response = HttpService:RequestAsync({
             Url = SERVER_URL .. "/update",
             Method = "POST",
             Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode({
-                instance_id = INSTANCE_ID,
-                secret      = WEBHOOK_SECRET,
-                username    = LocalPlayer.Name,
-                job_id      = game.JobId,
-                bucks       = bucks,
-                eggs        = eggs,
-                status      = currentStatus,
-                mode        = currentMode,
-            })
+            Body = HttpService:JSONEncode(body),
         })
         if response.Success then
             local data = HttpService:JSONDecode(response.Body)
@@ -492,10 +523,11 @@ local function sendStatus()
                 elseif cmd == "stop_farm" and farming then stopFarm()
                 elseif cmd == "start_egg" and not eggBuying then startEgg()
                 elseif cmd == "stop_egg" and eggBuying then stopEgg()
+                elseif cmd == "debug_on" then debugEnabled = true
+                elseif cmd == "debug_off" then debugEnabled = false
                 elseif cmd:sub(1, 6) == "trade:" then
                     local parts = cmd:split(":")
-                    local target = parts[2]
-                    local count  = tonumber(parts[3])
+                    local target, count = parts[2], tonumber(parts[3])
                     if target and count and usernameBox and totalEggsBox and startTradeBtn then
                         usernameBox.Text  = target
                         totalEggsBox.Text = tostring(count)
@@ -541,8 +573,7 @@ local function ensureInHouse(setFarmStatus)
     if door then
         local touchToEnter = door:FindFirstChild("WorkingParts") and door.WorkingParts:FindFirstChild("TouchToEnter")
         if touchToEnter then
-            local doorCFrame = touchToEnter.CFrame
-            local behind = doorCFrame * CFrame.new(0, 0, 3)
+            local behind = touchToEnter.CFrame * CFrame.new(0, 0, 3)
             root.CFrame = CFrame.new(behind.Position + Vector3.new(0, 3, 0))
             task.wait(0.1)
             humanoid:MoveTo(touchToEnter.Position)
@@ -767,7 +798,8 @@ startTradeBtn.MouseButton1Click:Connect(function()
             currentStatus = "trade " .. i .. "/" .. #batches
             local ok, err = pcall(doOneTrade, target, batchSize, eggKind)
             if not ok then
-                setTradeStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80)); break
+                setTradeStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80))
+                logErr("trade", err); break
             end
         end
         setTradeStatus("Done!", Color3.fromRGB(100,220,100))
@@ -802,7 +834,7 @@ end
 function startFarm()
     farming = true; currentMode = "farm"
     farmBtn.Text = "Stop AutoFarm"; farmBtn.BackgroundColor3 = Color3.fromRGB(170,60,60)
-    setFarmStatus("Starting...")
+    setFarmStatus("Starting..."); lastError = ""
     becomeBaby(); fillPetPen(); claimPetPen(); claimMoneyTree(); claimExtras()
     local loopCount = 0
     farmThread = task.spawn(function()
@@ -815,8 +847,11 @@ function startFarm()
                 ensureInHouse(setFarmStatus)
                 pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
                 task.wait(0.2)
+                dbgInHouse = isInHouse()
+                dbgFurniture = countFurniture()
+                -- income (throttled so the money tree doesn't yank us every loop)
                 if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
-                if loopCount % 600 == 0 then pcall(claimMoneyTree) end
+                if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
                 local ailments = getActiveAilments(farmStatusLabel)
                 if #ailments == 0 then
                     setFarmStatus("All happy!"); ailmentLabel.Text = ""
@@ -896,8 +931,15 @@ function startFarm()
                             furniture = findNearestFurniture(root, AILMENT_USE_ID_FALLBACK[fixable.kind])
                         end
                         if furniture then
+                            local m = furniture.model
+                            local before = root.Position
+                            local ok, info = pcall(activateFurniture, furniture)
+                            task.wait(0.3)
+                            local nr = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                            local moved = nr and (nr.Position - before).Magnitude > 5
+                            logErr("fix " .. fixable.kind, "model=" .. (m and m.Name or "?") .. " res=" .. tostring(info) .. " moved=" .. tostring(moved))
                             local waited = 0
-                            while farming and waited < 20 do
+                            while farming and waited < 16 do
                                 pcall(activateFurniture, furniture)
                                 task.wait(4); waited = waited + 4
                                 local still = false
@@ -908,6 +950,7 @@ function startFarm()
                             end
                         else
                             setFarmStatus("No furniture: " .. fixable.kind, Color3.fromRGB(255,200,0))
+                            logErr("findFurniture", "none for " .. fixable.kind .. " (loaded=" .. dbgFurniture .. ")")
                         end
                     end
                 end
@@ -966,7 +1009,6 @@ local function setEggStatus(msg, color)
 end
 
 local eggThread = nil
-local eggBoughtCount = 0
 
 function stopEgg()
     eggBuying = false; currentMode = "idle"; currentStatus = "stopped"
@@ -996,6 +1038,7 @@ function startEgg()
                 setEggStatus("Bought! Total: " .. eggBoughtCount)
             else
                 setEggStatus("Failed: " .. tostring(err):sub(1,30), Color3.fromRGB(255,200,0))
+                logErr("buyEgg", err)
             end
             task.wait(interval)
         end
