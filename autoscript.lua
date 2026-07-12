@@ -1,13 +1,10 @@
 --[[
     AutoScript - Combined AutoTrade + AutoFarm + AutoEgg GUI
-    Local server only. Debug reporting + control-panel toggle.
-    LOW-DETAIL render mode: world loads, cheapest quality.
+    Local server only. No rendering manipulation.
 --]]
 
 local Players    = game:GetService("Players")
 local CS         = game:GetService("CollectionService")
-local RunService = game:GetService("RunService")
-local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
@@ -18,117 +15,37 @@ local EquippedPets       = Fsys("EquippedPets")
 local CharWrapperClient  = Fsys("CharWrapperClient")
 local StateManagerClient = Fsys("StateManagerClient")
 
--- ============================================================
--- CONFIG
--- DISABLE_RENDER=false -> keep rendering ON at lowest detail so the
---   world/house streams and loads (farm can enter + find furniture).
--- DISABLE_RENDER=true  -> fully kill 3D (lighter, but world won't load).
--- ============================================================
-local DISABLE_RENDER = false
-local SERVER_URL     = "http://152.53.144.174:5000"
-local INSTANCE_ID    = LocalPlayer.Name
-local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
-
--- Forward declarations (so sendStatus below can reach these) --------------
+-- Forward declarations so sendStatus (defined below) can reach these;
+-- they get assigned further down once the GUI / farm / egg logic is built.
 local startFarm, stopFarm, startEgg, stopEgg
 local usernameBox, totalEggsBox, startTradeBtn
 
 -- ============================================================
--- SHARED STATE / DEBUG
--- ============================================================
-local farming, trading, eggBuying = false, false, false
-local currentMode   = "idle"
-local currentStatus = "idle"
-local debugEnabled  = false
-local lastError     = ""
-local dbgFurniture  = -1
-local dbgInHouse    = false
-local eggBoughtCount = 0
-
-local function logErr(where, err)
-    lastError = tostring(where) .. ": " .. tostring(err):sub(1, 120)
-end
-
--- Fire `action` every `fireEvery`s, checking `isDone` every 0.5s, until done
--- or `timeout`s elapse. Robust to the very slow container environment.
-local function retryUntil(action, isDone, timeout, fireEvery)
-    local elapsed, lastFire = 0, -math.huge
-    while elapsed < timeout do
-        local ok, done = pcall(isDone)
-        if ok and done then return true end
-        if elapsed - lastFire >= fireEvery then pcall(action); lastFire = elapsed end
-        task.wait(0.5); elapsed = elapsed + 0.5
-    end
-    local ok, done = pcall(isDone)
-    return ok and done
-end
-
-local function countFurniture()
-    local okF, FMT = pcall(Fsys, "FurnitureModelTracker")
-    if okF and FMT then
-        local models = FMT.get_furniture_models_list()
-        if models then local n = 0; for _ in pairs(models) do n = n + 1 end; return n end
-    end
-    return 0
-end
-
-local function isInHouse()
-    local ok, InteriorsM = pcall(Fsys, "InteriorsM")
-    if not ok or not InteriorsM then return false end
-    local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
-    return loc ~= nil and loc.destination_id == "housing"
-end
-
--- Apply cheapest render settings (keeps world loading, minimal CPU).
-local function applyLowDetail()
-    pcall(function()
-        UserSettings():GetService("UserGameSettings").SavedQualityLevel = Enum.SavedQualityLevel.QualityLevel1
-    end)
-    pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
-    pcall(function()
-        local Lighting = game:GetService("Lighting")
-        Lighting.GlobalShadows = false
-        Lighting.FogEnd = 9e9
-        Lighting.Brightness = 0
-        for _, e in ipairs(Lighting:GetChildren()) do
-            if e:IsA("PostEffect") then e.Enabled = false end
-        end
-    end)
-end
-
--- ============================================================
--- AUTO JOIN: retry-until-spawned (slow env), hide menu, low detail
+-- AUTO JOIN: wait for load -> choose team -> spawn home -> hide menu GUI
 -- ============================================================
 task.spawn(function()
     if not game:IsLoaded() then game.Loaded:Wait() end
-
-    local function menuFire(name)
-        if not pcall(function() RouterClient.get(name):FireServer() end) then
-            pcall(function() RouterClient.get(name):InvokeServer() end)
-        end
-    end
-
-    retryUntil(function()
-        menuFire("MainMenuAPI/AcceptTermsOfServiceAndPrivacyPolicy")
-        menuFire("MainMenuAPI/ViewedNews")
-        menuFire("MainMenuAPI/ViewedPatchNotes")
-        menuFire("MainMenuAPI/ViewedMerchPopup")
-        menuFire("MainMenuAPI/ViewedSubscriptionsPopup")
-        pcall(function()
-            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies",
-                { dont_send_back_home = false, source_for_logging = "autoscript" })
-        end)
-        pcall(function()
-            RouterClient.get("TeamAPI/Spawn"):InvokeServer("home",
-                { source_for_logging = "autoscript" })
-        end)
-    end, function()
-        return LocalPlayer.Character ~= nil
-    end, 180, 4)
-
-    if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
+    local t = 0
+    while not LocalPlayer.Character and t < 20 do task.wait(0.5); t = t + 0.5 end
     task.wait(2)
 
+    -- dismiss news, choose Babies team, spawn at home (retry a few times)
+    for _ = 1, 5 do
+        pcall(function() RouterClient.get("MainMenuAPI/ViewedNews"):FireServer() end)
+        task.wait(0.3)
+        pcall(function()
+            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies", {
+                dont_send_back_home = false, source_for_logging = "autoscript"
+            })
+        end)
+        task.wait(0.3)
+        pcall(function()
+            RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autoscript" })
+        end)
+        task.wait(1)
+    end
+
+    -- best-effort: hide leftover main-menu / play / news GUIs (skips our own)
     pcall(function()
         for _, g in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
             if g:IsA("ScreenGui") and g.Name ~= "AutoScriptGui" then
@@ -139,10 +56,7 @@ task.spawn(function()
             end
         end
     end)
-
-    -- leave rendering alone; just make sure it's ON (undo any prior disable)
-    pcall(function() RunService:Set3dRenderingEnabled(true) end)
-    end)
+end)
 
 -- ============================================================
 -- TRADE CONFIG
@@ -166,7 +80,6 @@ local selectedEggIndex = 1
 local FARM_LOOP_INTERVAL = 0.5
 local FARM_TP_OFFSET     = Vector3.new(0, 4, 0)
 local FARM_USE_WAIT      = 0.3
-local HOUSE_TIMEOUT      = 180
 
 local AILMENT_USE_ID_FALLBACK = {
     ["toilet"]  = "ailments_refresh_2024_litter_box",
@@ -179,6 +92,7 @@ local AILMENT_USE_ID_FALLBACK = {
 
 local AILMENT_MOVEMENT = { ["walk"] = true, ["play"] = true, ["pet_me"] = true }
 
+-- Ailments we skip entirely (game handles them automatically)
 local AILMENT_SKIP = {
     ["journey_2026_truck_repair"] = true, ["at_work"] = true, ["salon"] = true,
     ["school"] = true, ["beach_party"] = true, ["camping"] = true,
@@ -384,6 +298,13 @@ local function getHouseOwner()
     return LocalPlayer
 end
 
+local function isInHouse()
+    local ok, InteriorsM = pcall(Fsys, "InteriorsM")
+    if not ok or not InteriorsM then return false end
+    local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
+    return loc ~= nil and loc.destination_id == "housing"
+end
+
 local function getHouseDoor()
     local houseExteriors = workspace:FindFirstChild("HouseExteriors")
     if houseExteriors then
@@ -427,8 +348,9 @@ local function becomeBaby()
     local team = ClientData.get("team")
     if team ~= "Babies" then
         task.spawn(function()
-            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies",
-                { dont_send_back_home = true, source_for_logging = "autofarm" })
+            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies", {
+                dont_send_back_home = true, source_for_logging = "autofarm"
+            })
         end)
         task.wait(0.5)
     end
@@ -501,12 +423,26 @@ task.spawn(function()
     end
 end)
 
+local farming   = false
+local trading   = false
+local eggBuying = false
+
 -- ============================================================
--- STATUS / DEBUG REPORTING
+-- WEBHOOK CONFIG
 -- ============================================================
+local SERVER_URL     = "http://152.53.144.174:5000"
+local INSTANCE_ID    = LocalPlayer.Name
+local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
+
+local HttpService = game:GetService("HttpService")
+
+local currentMode   = "idle"
+local currentStatus = "idle"
+
 local function getEggCounts()
     local inventory = ClientData.get("inventory") or {}
-    local counts, pets = {}, inventory.pets or {}
+    local counts = {}
+    local pets = inventory.pets or {}
     for _, item in pairs(pets) do
         if item.kind and item.kind:find("egg") then
             counts[item.kind] = (counts[item.kind] or 0) + 1
@@ -515,41 +451,24 @@ local function getEggCounts()
     return counts
 end
 
-local function buildDebug()
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    local pos = root and string.format("%.0f, %.0f, %.0f", root.Position.X, root.Position.Y, root.Position.Z) or "none"
-    return {
-        team       = tostring(ClientData.get("team")),
-        has_char   = char ~= nil,
-        char_pos   = pos,
-        in_house   = dbgInHouse,
-        furniture  = dbgFurniture,
-        task       = currentStatus,
-        egg_bought = eggBoughtCount,
-        last_error = lastError,
-    }
-end
-
 local function sendStatus()
+    local bucks = ClientData.get("money") or 0
+    local eggs  = getEggCounts()
     pcall(function()
-        local body = {
-            instance_id = INSTANCE_ID,
-            secret      = WEBHOOK_SECRET,
-            username    = LocalPlayer.Name,
-            job_id      = game.JobId,
-            bucks       = ClientData.get("money") or 0,
-            eggs        = getEggCounts(),
-            status      = currentStatus,
-            mode        = currentMode,
-            error       = lastError,
-        }
-        if debugEnabled then body.debug = buildDebug() end
         local response = HttpService:RequestAsync({
             Url = SERVER_URL .. "/update",
             Method = "POST",
             Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode(body),
+            Body = HttpService:JSONEncode({
+                instance_id = INSTANCE_ID,
+                secret      = WEBHOOK_SECRET,
+                username    = LocalPlayer.Name,
+                job_id      = game.JobId,
+                bucks       = bucks,
+                eggs        = eggs,
+                status      = currentStatus,
+                mode        = currentMode,
+            })
         })
         if response.Success then
             local data = HttpService:JSONDecode(response.Body)
@@ -559,11 +478,10 @@ local function sendStatus()
                 elseif cmd == "stop_farm" and farming then stopFarm()
                 elseif cmd == "start_egg" and not eggBuying then startEgg()
                 elseif cmd == "stop_egg" and eggBuying then stopEgg()
-                elseif cmd == "debug_on" then debugEnabled = true
-                elseif cmd == "debug_off" then debugEnabled = false
                 elseif cmd:sub(1, 6) == "trade:" then
                     local parts = cmd:split(":")
-                    local target, count = parts[2], tonumber(parts[3])
+                    local target = parts[2]
+                    local count  = tonumber(parts[3])
                     if target and count and usernameBox and totalEggsBox and startTradeBtn then
                         usernameBox.Text  = target
                         totalEggsBox.Text = tostring(count)
@@ -582,43 +500,47 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- ENSURE IN HOUSE (generous, retry-until for slow containers)
--- ============================================================
 local function ensureInHouse(setFarmStatus)
-    if isInHouse() then return true end
+    if isInHouse() then return end
     setFarmStatus("Going to house...")
-    local entered = retryUntil(function()
-        local ok, InteriorsM = pcall(Fsys, "InteriorsM")
-        if ok and InteriorsM then
-            local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
-            if loc and loc.destination_id ~= "housing" then
-                pcall(function() InteriorsM.exit_smooth() end)
-            end
-            pcall(function()
-                InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer })
-            end)
+    local ok, InteriorsM = pcall(Fsys, "InteriorsM")
+    if ok and InteriorsM then
+        local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
+        if loc and loc.destination_id ~= "housing" then
+            pcall(function() InteriorsM.exit_smooth() end)
+            task.wait(2)
         end
-        local char     = LocalPlayer.Character
-        local root     = char and char:FindFirstChild("HumanoidRootPart")
-        local humanoid = char and char:FindFirstChild("Humanoid")
-        if root and humanoid then
-            local door = getHouseDoor()
-            if door then
-                local tte = door:FindFirstChild("WorkingParts") and door.WorkingParts:FindFirstChild("TouchToEnter")
-                if tte then
-                    local behind = tte.CFrame * CFrame.new(0, 0, 3)
-                    root.CFrame = CFrame.new(behind.Position + Vector3.new(0, 3, 0))
-                    task.wait(0.1)
-                    humanoid:MoveTo(tte.Position)
-                    task.wait(0.3)
-                    root.CFrame = CFrame.new(tte.Position + Vector3.new(0, 2, 0))
-                end
-            end
+        pcall(function()
+            InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer })
+        end)
+        local timeout = 0
+        while timeout < 30 do
+            task.wait(0.3); timeout = timeout + 0.3
+            if isInHouse() then setFarmStatus("In house!"); return end
         end
-    end, isInHouse, HOUSE_TIMEOUT, 5)
-    if entered then setFarmStatus("In house!") else setFarmStatus("Couldn't enter house", Color3.fromRGB(255,80,80)); logErr("ensureInHouse", "timeout") end
-    return entered
+    end
+    local char     = LocalPlayer.Character
+    local root     = char and char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char and char:FindFirstChild("Humanoid")
+    if not root or not humanoid then return end
+    local door = getHouseDoor()
+    if door then
+        local touchToEnter = door:FindFirstChild("WorkingParts") and door.WorkingParts:FindFirstChild("TouchToEnter")
+        if touchToEnter then
+            local doorCFrame = touchToEnter.CFrame
+            local behind = doorCFrame * CFrame.new(0, 0, 3)
+            root.CFrame = CFrame.new(behind.Position + Vector3.new(0, 3, 0))
+            task.wait(0.1)
+            humanoid:MoveTo(touchToEnter.Position)
+            task.wait(0.3)
+            root.CFrame = CFrame.new(touchToEnter.Position + Vector3.new(0, 2, 0))
+        end
+    end
+    local timeout = 0
+    while timeout < 8 do
+        task.wait(0.2); timeout = timeout + 0.2
+        if isInHouse() then setFarmStatus("In house!"); return end
+    end
 end
 
 -- ============================================================
@@ -831,8 +753,7 @@ startTradeBtn.MouseButton1Click:Connect(function()
             currentStatus = "trade " .. i .. "/" .. #batches
             local ok, err = pcall(doOneTrade, target, batchSize, eggKind)
             if not ok then
-                setTradeStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80))
-                logErr("trade", err); break
+                setTradeStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80)); break
             end
         end
         setTradeStatus("Done!", Color3.fromRGB(100,220,100))
@@ -867,7 +788,7 @@ end
 function startFarm()
     farming = true; currentMode = "farm"
     farmBtn.Text = "Stop AutoFarm"; farmBtn.BackgroundColor3 = Color3.fromRGB(170,60,60)
-    setFarmStatus("Starting..."); lastError = ""
+    setFarmStatus("Starting...")
     becomeBaby(); fillPetPen(); claimPetPen(); claimMoneyTree(); claimExtras()
     local loopCount = 0
     farmThread = task.spawn(function()
@@ -880,8 +801,6 @@ function startFarm()
                 ensureInHouse(setFarmStatus)
                 pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
                 task.wait(0.2)
-                dbgInHouse = isInHouse()
-                dbgFurniture = countFurniture()
                 pcall(claimPetPen); pcall(fillPetPen); pcall(claimMoneyTree)
                 local ailments = getActiveAilments(farmStatusLabel)
                 if #ailments == 0 then
@@ -962,14 +881,18 @@ function startFarm()
                             furniture = findNearestFurniture(root, AILMENT_USE_ID_FALLBACK[fixable.kind])
                         end
                         if furniture then
-                            local ok2, err = pcall(activateFurniture, furniture)
-                            if not ok2 then
-                                setFarmStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80))
-                                logErr("activateFurniture", err)
+                            local waited = 0
+                            while farming and waited < 20 do
+                                pcall(activateFurniture, furniture)
+                                task.wait(4); waited = waited + 4
+                                local still = false
+                                for _, a in ipairs(getActiveAilments(nil)) do
+                                    if a.kind == fixable.kind then still = true; break end
+                                end
+                                if not still then break end
                             end
                         else
                             setFarmStatus("No furniture: " .. fixable.kind, Color3.fromRGB(255,200,0))
-                            logErr("findFurniture", "none for " .. fixable.kind .. " (loaded=" .. dbgFurniture .. ")")
                         end
                     end
                 end
@@ -1028,6 +951,7 @@ local function setEggStatus(msg, color)
 end
 
 local eggThread = nil
+local eggBoughtCount = 0
 
 function stopEgg()
     eggBuying = false; currentMode = "idle"; currentStatus = "stopped"
@@ -1057,7 +981,6 @@ function startEgg()
                 setEggStatus("Bought! Total: " .. eggBoughtCount)
             else
                 setEggStatus("Failed: " .. tostring(err):sub(1,30), Color3.fromRGB(255,200,0))
-                logErr("buyEgg", err)
             end
             task.wait(interval)
         end
