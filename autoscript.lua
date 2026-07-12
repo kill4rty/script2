@@ -815,7 +815,8 @@ function startFarm()
                 ensureInHouse(setFarmStatus)
                 pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
                 task.wait(0.2)
-                pcall(claimPetPen); pcall(fillPetPen); pcall(claimMoneyTree)
+                if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
+                if loopCount % 600 == 0 then pcall(claimMoneyTree) end
                 local ailments = getActiveAilments(farmStatusLabel)
                 if #ailments == 0 then
                     setFarmStatus("All happy!"); ailmentLabel.Text = ""
