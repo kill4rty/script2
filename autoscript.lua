@@ -105,18 +105,8 @@ local FARM_LOOP_INTERVAL = 0.5
 local MONEYTREE_EVERY    = 600
 local FIX_TIMEOUT        = 26   -- seconds to wait for a furniture fix to complete
 
--- ailments handled by non-furniture logic
-local AILMENT_MOVEMENT = { ["walk"] = true, ["play"] = true }
--- tool-based needs FNA can't fix (food/water) - skipped for now
-local AILMENT_TOOL = { ["hungry"] = true, ["thirsty"] = true }
--- event/mystery ailments we don't try to fix
-local AILMENT_SKIP = {
-    ["journey_2026_truck_repair"] = true, ["at_work"] = true, ["salon"] = true,
-    ["school"] = true, ["beach_party"] = true, ["camping"] = true,
-    ["party_zone"] = true, ["pizza_party"] = true, ["ride"] = true,
-    ["bored"] = true, ["mystery"] = true, ["diving_board"] = true,
-    ["leaf_pile"] = true, ["rain_puddle"] = true, ["snowman"] = true,
-}
+-- ALLOWLIST: only these money-making furniture needs get auto-fixed; everything else ignored
+local AILMENT_FIX = { ["sleepy"] = true, ["toilet"] = true, ["dirty"] = true, ["sick"] = true }
 
 -- ============================================================
 -- EGG BUY OPTIONS
@@ -689,7 +679,7 @@ function startFarm()
                     -- pick first fixable ailment
                     local fixable = nil
                     for _, a in ipairs(ailments) do
-                        if not AILMENT_SKIP[a.kind] and not AILMENT_TOOL[a.kind] then fixable = a; break end
+                        if AILMENT_FIX[a.kind] then fixable = a; break end
                     end
 
                     if not fixable then
