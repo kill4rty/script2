@@ -391,7 +391,14 @@ local function activateFurniture(entry)
     -- guard: don't teleport to an insane/void position
     if (useBlock.Position - root.Position).Magnitude > 1000 then return false, "furniture too far" end
     root.CFrame = CFrame.new(useBlock.Position + FARM_TP_OFFSET)
-    task.wait(FARM_USE_WAIT)
+    task.wait(FARM_USE_WAIT) 
+    -- server validates the use_id StringValue in the use block, not the part name
+    local useName = useBlock.Name
+    local cfg = useBlock:FindFirstChild("Configuration")
+    local useIdVal = cfg and cfg:FindFirstChild("use_id")
+    if useIdVal and useIdVal.Value and useIdVal.Value ~= "" then
+        useName = useIdVal.Value
+    end
     local unique = entry.unique
         or model:GetAttribute("furniture_unique")
         or model:GetAttribute("unique")
@@ -409,7 +416,7 @@ local function activateFurniture(entry)
     -- fire the invoke in its own thread so a hanging server call can't freeze the farm
     task.spawn(function()
         pcall(function()
-            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useBlock.Name, payload, petChar)
+            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useName, payload, petChar)
         end)
     end)
     return true, tostring(unique)
