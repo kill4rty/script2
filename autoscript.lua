@@ -247,16 +247,6 @@ local function fixFurnitureAilment(kind, wrapper)
     return false, "timeout after " .. waited .. "s"
 end
 
--- feed baby from inventory stock via the game's own action
-local function feedFromStock(a)
-    local ok, e = pcall(function() return a.obj:do_action(a.wrapper) end)
-    local waited = 0
-    while farming and waited < FIX_TIMEOUT do
-        task.wait(2); waited = waited + 2
-        if not ailmentStillActive(a.kind, a.wrapper) then return true, "fed in " .. waited .. "s" end
-    end
-    return false, "feed timeout (start ok=" .. tostring(ok) .. ")"
-end
 
 -- one dispatcher: returns ok, info
 local function tryFixAilment(a)
@@ -272,14 +262,17 @@ local function tryFixAilment(a)
     elseif AILMENT_FURNITURE[a.kind] then
         return fixFurnitureAilment(a.kind, a.wrapper)
     elseif AILMENT_FEED[a.kind] then
-        if a.tag == "baby" then return feedFromStock(a)      -- baby: feed from stock
-        else return fixFurnitureAilment(a.kind, a.wrapper) end -- pet: use the bowl
+        if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end  -- pet: bowl
+        return false, "baby feed disabled"
     end
     return false, "no handler"
 end
 
-local function isHandled(kind)
-    return AILMENT_FURNITURE[kind] or AILMENT_FEED[kind] or kind == "pet_me"
+local function isHandled(a)
+    if a.kind == "pet_me" then return true end
+    if AILMENT_FURNITURE[a.kind] then return true end
+    if AILMENT_FEED[a.kind] then return a.tag == "pet" end  -- pet bowls only; baby feed off
+    return false
 end
 
 -- ============================================================
@@ -610,7 +603,7 @@ function startFarm()
                     for _, a in ipairs(ailments) do
                         local key = (a.tag or "?") .. ":" .. a.kind
                         local cd = ailmentCooldown[key]
-                        if isHandled(a.kind) and not (cd and now < cd) then fixable = a; break end
+                        if isHandled(a) and not (cd and now < cd) then fixable = a; break end
                     end
 
                     if not fixable then
