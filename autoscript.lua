@@ -22,6 +22,7 @@ local StateManagerClient = Fsys("StateManagerClient")
 local SERVER_URL     = "http://152.53.144.174:5000"
 local INSTANCE_ID    = LocalPlayer.Name
 local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
+local AUTOBUY_FURNITURE = true   -- buy essential ailment furniture on farm start
 
 local startFarm, stopFarm, startEgg, stopEgg
 local usernameBox, totalEggsBox, startTradeBtn
@@ -59,8 +60,7 @@ local function isInHouse()
 end
 
 -- ============================================================
--- AUTO JOIN: wait for load -> choose team -> spawn home -> hide menu GUI
--- (no rendering manipulation)
+-- AUTO JOIN
 -- ============================================================
 task.spawn(function()
     if not game:IsLoaded() then game.Loaded:Wait() end
@@ -116,15 +116,23 @@ local selectedEggIndex = 1
 local FARM_LOOP_INTERVAL = 0.5
 local FARM_TP_OFFSET     = Vector3.new(0, 4, 0)
 local FARM_USE_WAIT      = 0.3
-local MONEYTREE_EVERY    = 600   -- loops (~5 min at 0.5s)
+local MONEYTREE_EVERY    = 600
 
 local AILMENT_USE_ID_FALLBACK = {
-    ["toilet"]  = "ailments_refresh_2024_litter_box",
-    ["hungry"]  = "ailments_refresh_2024_cheap_food_bowl",
-    ["thirsty"] = "ailments_refresh_2024_cheap_water_bowl",
-    ["dirty"]   = "generic_bathtub",
-    ["sleepy"]  = "generic_crib",
-    ["sick"]    = "hospital_refresh_2023_healing_bed",
+    ["toilet"]  = "toilet",
+    ["hungry"]  = "pet_food_bowl",
+    ["thirsty"] = "pet_water_bowl",
+    ["dirty"]   = "modernshower",
+    ["sleepy"]  = "basicbed",
+}
+
+-- furniture kinds to auto-place if missing (one per ailment)
+local ESSENTIAL_FURNITURE = {
+    "pet_food_bowl",
+    "pet_water_bowl",
+    "basicbed",
+    "toilet",
+    "modernshower",
 }
 
 local AILMENT_MOVEMENT = { ["walk"] = true, ["play"] = true, ["pet_me"] = true }
@@ -246,10 +254,9 @@ local function getCharWrappers()
     return wrappers
 end
 
-local function getActiveAilments(statusLabel)
+local function getActiveAilments()
     local results = {}
     local wrappers = getCharWrappers()
-    if statusLabel then statusLabel.Text = "Wrappers: " .. #wrappers end
     for _, w in ipairs(wrappers) do
         local ok, ailments = pcall(function() return AilmentsClient.get_ailments_for_pet(w) end)
         if ok and ailments then
@@ -275,6 +282,7 @@ local function getPetChar()
     return nil
 end
 
+-- find furniture that can CURE a given ailment (correct: captures pcall result)
 local function findNearestFurniture(root, targetAilmentKind)
     local best, bestDist = nil, math.huge
     local ok, AFH  = pcall(Fsys, "AilmentsFurnitureHelper")
@@ -299,24 +307,39 @@ local function findNearestFurniture(root, targetAilmentKind)
             end
         end
     end
+    return best
+end
+
+-- find furniture by its KIND attribute (for the fallback)
+local function findFurnitureByKind(root, furnitureKind)
+    local best, bestDist = nil, math.huge
+    local ok2, FMT = pcall(Fsys, "FurnitureModelTracker")
+    if ok2 and FMT then
+        local models = FMT.get_furniture_models_list()
+        if models then
+            for _, model in pairs(models) do
+                if model:GetAttribute("furniture_kind") == furnitureKind then
+                    local p = model:FindFirstChild("PlacementBlock") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                    if p then
+                        local d = (root.Position - p.Position).Magnitude
+                        if d < bestDist then
+                            best = { unique = model:GetAttribute("furniture_unique"), model = model, player = nil }
+                            bestDist = d
+                        end
+                    end
+                end
+            end
+        end
+    end
     if not best then
         for _, obj in workspace:GetDescendants() do
-            if obj:IsA("Model") then
-                local kind = obj:GetAttribute("furniture_kind")
-                if kind then
-                    local ok3, valid = pcall(function()
-                        local A = Fsys("AilmentsFurnitureHelper")
-                        return A.is_furniture_valid(kind, targetAilmentKind, obj)
-                    end)
-                    if ok3 and valid then
-                        local p = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
-                        if p then
-                            local d = (root.Position - p.Position).Magnitude
-                            if d < bestDist then
-                                best = { unique = obj:GetAttribute("furniture_unique"), model = obj, player = nil }
-                                bestDist = d
-                            end
-                        end
+            if obj:IsA("Model") and obj:GetAttribute("furniture_kind") == furnitureKind then
+                local p = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+                if p then
+                    local d = (root.Position - p.Position).Magnitude
+                    if d < bestDist then
+                        best = { unique = obj:GetAttribute("furniture_unique"), model = obj, player = nil }
+                        bestDist = d
                     end
                 end
             end
@@ -352,8 +375,7 @@ local function getHouseDoor()
     return nil
 end
 
--- Robust: teleport to the furniture FIRST (so the baby actually moves), then
--- fire ActivateFurniture using whatever attribute holds the unique id.
+-- teleport to furniture (only if it's a sane distance), fire activate non-blocking
 local function activateFurniture(entry)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -366,6 +388,8 @@ local function activateFurniture(entry)
         or model.PrimaryPart
         or model:FindFirstChildWhichIsA("BasePart")
     if not useBlock then return false, "no useBlock" end
+    -- guard: don't teleport to an insane/void position
+    if (useBlock.Position - root.Position).Magnitude > 1000 then return false, "furniture too far" end
     root.CFrame = CFrame.new(useBlock.Position + FARM_TP_OFFSET)
     task.wait(FARM_USE_WAIT)
     local unique = entry.unique
@@ -382,6 +406,7 @@ local function activateFurniture(entry)
     local payload = { cframe = useBlock.CFrame * CFrame.new(0, useBlock.Size.Y / 2, 0) }
     local owner = entry.player or getHouseOwner()
     local petChar = getPetChar() or char
+    -- fire the invoke in its own thread so a hanging server call can't freeze the farm
     task.spawn(function()
         pcall(function()
             RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useBlock.Name, payload, petChar)
@@ -457,8 +482,26 @@ local function claimMoneyTree()
     end
 end
 
+-- buy + place the essential ailment furniture if the house is missing it
+local function buyEssentialFurniture()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    for i, kind in ipairs(ESSENTIAL_FURNITURE) do
+        if not findFurnitureByKind(root, kind) then
+            pcall(function()
+                local placeCFrame = root.CFrame * CFrame.new((i - 3) * 6, 0, -6)
+                RouterClient.get("HousingAPI/BuyFurnitures"):InvokeServer({
+                    { ["kind"] = kind, ["properties"] = { ["cframe"] = placeCFrame } }
+                })
+            end)
+            task.wait(0.4)
+        end
+    end
+end
+
 -- ============================================================
--- PAYOUT: auto-collect the timed "10 bucks" popup
+-- PAYOUT
 -- ============================================================
 task.spawn(function()
     while true do
@@ -470,7 +513,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- STATUS / DEBUG REPORTING
+-- STATUS / DEBUG
 -- ============================================================
 local function getEggCounts()
     local inventory = ClientData.get("inventory") or {}
@@ -550,10 +593,12 @@ task.spawn(function()
     end
 end)
 
+-- ============================================================
+-- ENSURE IN HOUSE (recovers from the void by respawning home)
+-- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return end
     setFarmStatus("Going to house...")
-    -- recover from the void: respawn home to get back to a known spot first
     pcall(function()
         RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autofarm" })
     end)
@@ -847,6 +892,7 @@ function startFarm()
     setFarmStatus("Starting..."); lastError = ""
     becomeBaby(); fillPetPen(); claimPetPen(); claimMoneyTree(); claimExtras()
     local loopCount = 0
+    local boughtFurniture = false
     farmThread = task.spawn(function()
         while farming do
             loopCount = loopCount + 1
@@ -859,10 +905,14 @@ function startFarm()
                 task.wait(0.2)
                 dbgInHouse = isInHouse()
                 dbgFurniture = countFurniture()
-                -- income (throttled so the money tree doesn't yank us every loop)
+                if AUTOBUY_FURNITURE and not boughtFurniture and dbgInHouse then
+                    setFarmStatus("Buying furniture...")
+                    pcall(buyEssentialFurniture)
+                    boughtFurniture = true
+                end
                 if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
                 if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
-                local ailments = getActiveAilments(farmStatusLabel)
+                local ailments = getActiveAilments()
                 if #ailments == 0 then
                     setFarmStatus("All happy!"); ailmentLabel.Text = ""
                 else
@@ -915,9 +965,8 @@ function startFarm()
                                 local waited = 0
                                 while farming and waited < 60 do
                                     task.wait(1); waited = waited + 1
-                                    local updated = getActiveAilments(nil)
                                     local still = false
-                                    for _, a in ipairs(updated) do if a.kind == "play" then still = true; break end end
+                                    for _, a in ipairs(getActiveAilments()) do if a.kind == "play" then still = true; break end end
                                     if not still then break end
                                 end
                                 ensureInHouse(setFarmStatus)
@@ -938,7 +987,7 @@ function startFarm()
                         setFarmStatus("Fixing: " .. fixable.kind)
                         local furniture = findNearestFurniture(root, fixable.kind)
                         if not furniture and AILMENT_USE_ID_FALLBACK[fixable.kind] then
-                            furniture = findNearestFurniture(root, AILMENT_USE_ID_FALLBACK[fixable.kind])
+                            furniture = findFurnitureByKind(root, AILMENT_USE_ID_FALLBACK[fixable.kind])
                         end
                         if furniture then
                             local m = furniture.model
@@ -953,7 +1002,7 @@ function startFarm()
                                 pcall(activateFurniture, furniture)
                                 task.wait(4); waited = waited + 4
                                 local still = false
-                                for _, a in ipairs(getActiveAilments(nil)) do
+                                for _, a in ipairs(getActiveAilments()) do
                                     if a.kind == fixable.kind then still = true; break end
                                 end
                                 if not still then break end
