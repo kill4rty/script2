@@ -1,14 +1,15 @@
 --[[
-    AutoScript - Combined AutoTrade + AutoFarm + AutoEgg GUI
-    Local server only. Debug + control-panel toggle. No rendering code.
+    AutoScript - AutoTrade + AutoFarm + AutoEgg
+    Local server only. Ailment fixing via native FurnitureNavigationAction.
 --]]
 
-local Players    = game:GetService("Players")
-local CS         = game:GetService("CollectionService")
+local Players     = game:GetService("Players")
+local CS          = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
+local RS          = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
-local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
+local Fsys = require(RS:WaitForChild("Fsys")).load
 local RouterClient       = Fsys("RouterClient")
 local ClientData         = Fsys("ClientData")
 local AilmentsClient     = Fsys("new:AilmentsClient")
@@ -16,19 +17,22 @@ local EquippedPets       = Fsys("EquippedPets")
 local CharWrapperClient  = Fsys("CharWrapperClient")
 local StateManagerClient = Fsys("StateManagerClient")
 
+-- native ailment-fixing modules (the real tap-to-fix flow)
+local FNA = require(RS.new.modules.Ailments.ClientActions.FurnitureNavigationAction)
+local AFH = require(RS.new.modules.Ailments.Helpers.AilmentsFurnitureHelper)
+
 -- ============================================================
 -- CONFIG
 -- ============================================================
-local SERVER_URL     = "http://152.53.144.174:5000"
-local INSTANCE_ID    = LocalPlayer.Name
+local SERVER_URL      = "http://152.53.144.174:5000"
+local INSTANCE_ID     = LocalPlayer.Name
 local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
-local AUTOBUY_FURNITURE = true   -- buy essential ailment furniture on farm start
 
 local startFarm, stopFarm, startEgg, stopEgg
 local usernameBox, totalEggsBox, startTradeBtn
 
 -- ============================================================
--- SHARED STATE / DEBUG
+-- STATE / DEBUG
 -- ============================================================
 local farming, trading, eggBuying = false, false, false
 local currentMode   = "idle"
@@ -40,7 +44,7 @@ local dbgInHouse    = false
 local eggBoughtCount = 0
 
 local function logErr(where, err)
-    lastError = tostring(where) .. ": " .. tostring(err):sub(1, 140)
+    lastError = tostring(where) .. ": " .. tostring(err):sub(1, 160)
 end
 
 local function countFurniture()
@@ -82,61 +86,30 @@ task.spawn(function()
         if LocalPlayer.Character then break end
         task.wait(1)
     end
-    pcall(function()
-        for _, g in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
-            if g:IsA("ScreenGui") and g.Name ~= "AutoScriptGui" then
-                local n = g.Name:lower()
-                if n:find("menu") or n:find("play") or n:find("title") or n:find("news") then
-                    g.Enabled = false
-                end
-            end
-        end
-    end)
 end)
 
 -- ============================================================
 -- TRADE CONFIG
 -- ============================================================
-local WAIT_AFTER_ACCEPT  = 1
-local WAIT_AFTER_ADD     = 0.1
-local WAIT_FOR_LOCK      = 6
-local WAIT_FOR_CONF_LOCK = 0.1
-local WAIT_STATE_CLEAR   = 5
-local MAX_WAIT_STATE     = 15
-local MAX_PER_TRADE      = 18
-
-local EGG_OPTIONS = {
-    { label = "Crystal Egg", kind = "pet_recycler_2025_crystal_egg" },
-}
+local WAIT_AFTER_ACCEPT, WAIT_AFTER_ADD = 1, 0.1
+local WAIT_FOR_LOCK, WAIT_FOR_CONF_LOCK = 6, 0.1
+local WAIT_STATE_CLEAR, MAX_WAIT_STATE = 5, 15
+local MAX_PER_TRADE = 18
+local EGG_OPTIONS = { { label = "Crystal Egg", kind = "pet_recycler_2025_crystal_egg" } }
 local selectedEggIndex = 1
 
 -- ============================================================
 -- FARM CONFIG
 -- ============================================================
 local FARM_LOOP_INTERVAL = 0.5
-local FARM_TP_OFFSET     = Vector3.new(0, 4, 0)
-local FARM_USE_WAIT      = 0.3
 local MONEYTREE_EVERY    = 600
+local FIX_TIMEOUT        = 26   -- seconds to wait for a furniture fix to complete
 
-local AILMENT_USE_ID_FALLBACK = {
-    ["toilet"]  = "toilet",
-    ["hungry"]  = "pet_food_bowl",
-    ["thirsty"] = "pet_water_bowl",
-    ["dirty"]   = "modernshower",
-    ["sleepy"]  = "basicbed",
-}
-
--- furniture kinds to auto-place if missing (one per ailment)
-local ESSENTIAL_FURNITURE = {
-    "pet_food_bowl",
-    "pet_water_bowl",
-    "basicbed",
-    "toilet",
-    "modernshower",
-}
-
-local AILMENT_MOVEMENT = { ["walk"] = true, ["play"] = true, ["pet_me"] = true }
-
+-- ailments handled by non-furniture logic
+local AILMENT_MOVEMENT = { ["walk"] = true, ["play"] = true }
+-- tool-based needs FNA can't fix (food/water) - skipped for now
+local AILMENT_TOOL = { ["hungry"] = true, ["thirsty"] = true }
+-- event/mystery ailments we don't try to fix
 local AILMENT_SKIP = {
     ["journey_2026_truck_repair"] = true, ["at_work"] = true, ["salon"] = true,
     ["school"] = true, ["beach_party"] = true, ["camping"] = true,
@@ -149,14 +122,11 @@ local AILMENT_SKIP = {
 -- EGG BUY OPTIONS
 -- ============================================================
 local EGG_BUY_OPTIONS = {
-    { label = "Cracked Egg (350)",    kind = "cracked_egg",                     category = "pets" },
-    { label = "Pet Egg (600)",        kind = "pet_egg",                          category = "pets" },
-    { label = "Endangered Egg (750)", kind = "endangered_2026_endangered_egg",   category = "pets" },
-    { label = "Moon Egg (750)",       kind = "moon_2025_egg",                    category = "pets" },
-    { label = "Aztec Egg (750)",      kind = "aztec_egg_2025_aztec_egg",         category = "pets" },
-    { label = "Garden Egg (750)",     kind = "garden_2024_egg",                  category = "pets" },
-    { label = "Desert Egg (750)",     kind = "desert_2024_egg",                  category = "pets" },
-    { label = "Royal Egg (1450)",     kind = "royal_egg",                        category = "pets" },
+    { label = "Cracked Egg (350)",    kind = "cracked_egg",                    category = "pets" },
+    { label = "Pet Egg (600)",        kind = "pet_egg",                         category = "pets" },
+    { label = "Endangered Egg (750)", kind = "endangered_2026_endangered_egg",  category = "pets" },
+    { label = "Moon Egg (750)",       kind = "moon_2025_egg",                   category = "pets" },
+    { label = "Royal Egg (1450)",     kind = "royal_egg",                       category = "pets" },
 }
 local selectedEggBuyIndex = 1
 
@@ -187,84 +157,69 @@ local function getEggUniques(eggKind, count)
 end
 
 local function waitForTradeStateClear()
-    local elapsed = 0
-    while elapsed < MAX_WAIT_STATE do
+    local e = 0
+    while e < MAX_WAIT_STATE do
         if ClientData.get("trade") == nil then return true end
-        task.wait(0.25); elapsed = elapsed + 0.25
+        task.wait(0.25); e = e + 0.25
     end
     return false
 end
 
 local function waitForNewNegotiationStage(lastId)
-    local elapsed = 0
-    while elapsed < MAX_WAIT_STATE do
+    local e = 0
+    while e < MAX_WAIT_STATE do
         local s = ClientData.get("trade")
-        if s and s.current_stage == "negotiation" and s.trade_id ~= lastId then
-            return true, s.trade_id
-        end
-        task.wait(0.25); elapsed = elapsed + 0.25
+        if s and s.current_stage == "negotiation" and s.trade_id ~= lastId then return true, s.trade_id end
+        task.wait(0.25); e = e + 0.25
     end
     return false, nil
 end
 
 local function waitForConfirmationStage(tradeId)
-    local elapsed = 0
-    while elapsed < 30 do
+    local e = 0
+    while e < 30 do
         local s = ClientData.get("trade")
         if s and s.current_stage == "confirmation" and s.trade_id == tradeId then return true end
-        task.wait(0.25); elapsed = elapsed + 0.25
+        task.wait(0.25); e = e + 0.25
     end
     return false
 end
 
 -- ============================================================
--- FARM HELPERS
+-- WRAPPERS / AILMENTS
 -- ============================================================
+local function getBabyWrapper()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local ok, w = pcall(function() return CharWrapperClient.get(char) end)
+    if ok then return w end
+    return nil
+end
+
 local function getCharWrappers()
     local wrappers = {}
-    local char = LocalPlayer.Character
-    if char then
-        local ok, w = pcall(function() return CharWrapperClient.get(char) end)
-        if ok and w then table.insert(wrappers, w) end
-    end
+    local baby = getBabyWrapper()
+    if baby then table.insert(wrappers, { w = baby, tag = "baby" }) end
     local ok1, w1 = pcall(function() return EquippedPets.get_my_equipped_char_wrappers() end)
-    if ok1 and w1 then for _, w in ipairs(w1) do table.insert(wrappers, w) end end
+    if ok1 and w1 then for _, w in ipairs(w1) do table.insert(wrappers, { w = w, tag = "pet" }) end end
     if #wrappers <= 1 then
-        local petWrappers = ClientData.get("pet_char_wrappers")
-        if petWrappers then
-            for _, c in pairs(petWrappers) do
-                local w = CharWrapperClient.get and CharWrapperClient.get(c)
-                if w then table.insert(wrappers, w) end
-            end
-        end
-    end
-    if #wrappers <= 1 then
-        local sm = ClientData.get("state_manager")
-        if sm then
-            local connected = StateManagerClient.get_chars_connected_to_me
-                and StateManagerClient.get_chars_connected_to_me(sm)
-            if connected then
-                for _, c in pairs(connected) do
-                    local w = CharWrapperClient.get and CharWrapperClient.get(c)
-                    if w then table.insert(wrappers, w) end
-                end
-            end
-        end
+        local pw = ClientData.get("pet_char_wrappers")
+        if pw then for _, c in pairs(pw) do local w = CharWrapperClient.get and CharWrapperClient.get(c); if w then table.insert(wrappers, { w = w, tag = "petcd" }) end end end
     end
     return wrappers
 end
 
+-- returns list of { kind, progress, wrapper }
 local function getActiveAilments()
     local results = {}
-    local wrappers = getCharWrappers()
-    for _, w in ipairs(wrappers) do
-        local ok, ailments = pcall(function() return AilmentsClient.get_ailments_for_pet(w) end)
+    for _, entry in ipairs(getCharWrappers()) do
+        local ok, ailments = pcall(function() return AilmentsClient.get_ailments_for_pet(entry.w) end)
         if ok and ailments then
             for _, a in pairs(ailments) do
                 if a and a.kind then
                     local progress = a.get_progress and a:get_progress() or (a.progress or 0)
                     if progress < 1 then
-                        table.insert(results, { kind = a.kind, progress = progress })
+                        table.insert(results, { kind = a.kind, progress = progress, wrapper = entry.w })
                     end
                 end
             end
@@ -274,169 +229,94 @@ local function getActiveAilments()
     return results
 end
 
-local function getPetChar()
-    local wrappers = getCharWrappers()
-    for i = 2, #wrappers do
-        if wrappers[i].char then return wrappers[i].char end
-    end
-    return nil
-end
-
--- find furniture that can CURE a given ailment (correct: captures pcall result)
-local function findNearestFurniture(root, targetAilmentKind)
-    local best, bestDist = nil, math.huge
-    local ok, AFH  = pcall(Fsys, "AilmentsFurnitureHelper")
-    local ok2, FMT = pcall(Fsys, "FurnitureModelTracker")
-    if ok and AFH and ok2 and FMT then
-        local models = FMT.get_furniture_models_list()
-        if models then
-            for _, model in pairs(models) do
-                local vok, valid = pcall(function()
-                    return AFH.is_furniture_model_valid(model, targetAilmentKind)
-                end)
-                if vok and valid then
-                    local p = model:FindFirstChild("PlacementBlock") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-                    if p then
-                        local d = (root.Position - p.Position).Magnitude
-                        if d < bestDist then
-                            best = { unique = model:GetAttribute("furniture_unique"), model = model, player = nil }
-                            bestDist = d
-                        end
-                    end
-                end
+local function ailmentStillActive(kind, wrapper)
+    local ok, ailments = pcall(function() return AilmentsClient.get_ailments_for_pet(wrapper) end)
+    if ok and ailments then
+        for _, a in pairs(ailments) do
+            if a.kind == kind then
+                local p = a.get_progress and a:get_progress() or (a.progress or 0)
+                if p < 1 then return true end
             end
         end
     end
-    return best
+    return false
 end
 
--- find furniture by its KIND attribute (for the fallback)
-local function findFurnitureByKind(root, furnitureKind)
-    local best, bestDist = nil, math.huge
-    local ok2, FMT = pcall(Fsys, "FurnitureModelTracker")
-    if ok2 and FMT then
-        local models = FMT.get_furniture_models_list()
-        if models then
-            for _, model in pairs(models) do
-                if model:GetAttribute("furniture_kind") == furnitureKind then
-                    local p = model:FindFirstChild("PlacementBlock") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-                    if p then
-                        local d = (root.Position - p.Position).Magnitude
-                        if d < bestDist then
-                            best = { unique = model:GetAttribute("furniture_unique"), model = model, player = nil }
-                            bestDist = d
-                        end
-                    end
-                end
-            end
+-- ============================================================
+-- FURNITURE AILMENT FIX (native FurnitureNavigationAction)
+--   teleport onto the furniture, then auto-use it
+-- ============================================================
+local function fixFurnitureAilment(kind, wrapper)
+    -- find where the valid furniture is
+    local pos
+    pcall(function() pos = AFH.find_furniture_position(kind) end)
+    if not pos then return false, "no furniture for " .. kind end
+    local target
+    if typeof(pos) == "Vector3" then target = pos
+    elseif typeof(pos) == "CFrame" then target = pos.Position
+    elseif type(pos) == "table" and pos.Position then target = pos.Position end
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if target and root then root.CFrame = CFrame.new(target + Vector3.new(0, 3, 0)); task.wait(1) end
+
+    local action = FNA.new({ ailment_to_boost = kind })
+    if not action:get_valid_interaction() then return false, "no interaction in range" end
+    pcall(function() action:automatically_use_nearby_furniture(wrapper) end)
+
+    local waited = 0
+    while farming and waited < FIX_TIMEOUT do
+        task.wait(2); waited = waited + 2
+        -- keep the baby parked on the spot in case it drifts
+        if target and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            LocalPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(target + Vector3.new(0, 3, 0))
+        end
+        if not ailmentStillActive(kind, wrapper) then
+            pcall(function() action:stop() end)
+            return true, "fixed in " .. waited .. "s"
         end
     end
-    if not best then
-        for _, obj in workspace:GetDescendants() do
-            if obj:IsA("Model") and obj:GetAttribute("furniture_kind") == furnitureKind then
-                local p = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
-                if p then
-                    local d = (root.Position - p.Position).Magnitude
-                    if d < bestDist then
-                        best = { unique = obj:GetAttribute("furniture_unique"), model = obj, player = nil }
-                        bestDist = d
-                    end
-                end
-            end
-        end
-    end
-    return best
+    pcall(function() action:stop() end)
+    return false, "timeout after " .. waited .. "s"
 end
 
-local function getHouseOwner()
-    local ok, InteriorsM = pcall(Fsys, "InteriorsM")
-    if ok and InteriorsM then
-        local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
-        if loc and loc.house_owner then return loc.house_owner end
-    end
-    return LocalPlayer
-end
-
-local function getHouseDoor()
-    local houseExteriors = workspace:FindFirstChild("HouseExteriors")
-    if houseExteriors then
-        for _, plot in houseExteriors:GetChildren() do
-            local house = plot:GetChildren()[1]
-            if house then
-                local door = house:FindFirstChild("Doors") and house.Doors:FindFirstChild("MainDoor")
-                if door then
-                    local config = door:FindFirstChild("WorkingParts") and door.WorkingParts:FindFirstChild("Configuration")
-                    local ownerVal = config and config:FindFirstChild("house_owner")
-                    if ownerVal and ownerVal.Value == LocalPlayer.Name then return door end
-                end
-            end
-        end
-    end
-    return nil
-end
-
--- teleport to furniture (only if it's a sane distance), fire activate non-blocking
+-- ============================================================
+-- MONEY TREE / INCOME
+-- ============================================================
 local function activateFurniture(entry)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return false, "no root" end
+    if not root then return false end
     local model = entry.model
-    if not model then return false, "no model" end
+    if not model then return false end
     local useBlocks = model:FindFirstChild("UseBlocks")
-    local useBlock = (useBlocks and useBlocks:FindFirstChildWhichIsA("BasePart"))
-        or model:FindFirstChild("UseBlock", true)
-        or model.PrimaryPart
-        or model:FindFirstChildWhichIsA("BasePart")
-    if not useBlock then return false, "no useBlock" end
-    -- guard: don't teleport to an insane/void position
-    if (useBlock.Position - root.Position).Magnitude > 1000 then return false, "furniture too far" end
-    root.CFrame = CFrame.new(useBlock.Position + FARM_TP_OFFSET)
-    task.wait(FARM_USE_WAIT) 
-    -- server validates the use_id StringValue in the use block, not the part name
+    local useBlock = (useBlocks and useBlocks:FindFirstChildWhichIsA("BasePart")) or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+    if not useBlock then return false end
+    root.CFrame = CFrame.new(useBlock.Position + Vector3.new(0, 4, 0))
+    task.wait(0.3)
+    local unique = entry.unique or model:GetAttribute("furniture_unique")
+    if not unique then return false end
     local useName = useBlock.Name
     local cfg = useBlock:FindFirstChild("Configuration")
     local useIdVal = cfg and cfg:FindFirstChild("use_id")
-    if useIdVal and useIdVal.Value and useIdVal.Value ~= "" then
-        useName = useIdVal.Value
-    end
-    local unique = entry.unique
-        or model:GetAttribute("furniture_unique")
-        or model:GetAttribute("unique")
-        or model:GetAttribute("id")
-        or model:GetAttribute("furniture_id")
-    if not unique then
-        for _, v in pairs(model:GetAttributes()) do
-            if type(v) == "string" and #v >= 8 then unique = v; break end
-        end
-    end
-    if not unique then return false, "no unique" end
+    if useIdVal and useIdVal.Value and useIdVal.Value ~= "" then useName = useIdVal.Value end
     local payload = { cframe = useBlock.CFrame * CFrame.new(0, useBlock.Size.Y / 2, 0) }
-    local owner = entry.player or getHouseOwner()
-    local petChar = getPetChar() or char
-    -- fire the invoke in its own thread so a hanging server call can't freeze the farm
     task.spawn(function()
         pcall(function()
-            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(owner, unique, useName, payload, petChar)
+            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(LocalPlayer, unique, useName, payload, char)
         end)
     end)
-    return true, tostring(unique)
+    return true
 end
 
 local function becomeBaby()
-    local team = ClientData.get("team")
-    if team ~= "Babies" then
+    if ClientData.get("team") ~= "Babies" then
         task.spawn(function()
-            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies", {
-                dont_send_back_home = true, source_for_logging = "autofarm"
-            })
+            RouterClient.get("TeamAPI/ChooseTeam"):InvokeServer("Babies", { dont_send_back_home = true, source_for_logging = "autofarm" })
         end)
         task.wait(0.5)
     end
 end
 
-local function claimPetPen()
-    RouterClient.get("IdleProgressionAPI/CommitAllProgression"):FireServer()
-end
+local function claimPetPen() RouterClient.get("IdleProgressionAPI/CommitAllProgression"):FireServer() end
 
 local function tryRemote(name)
     if not pcall(function() RouterClient.get(name):InvokeServer() end) then
@@ -475,41 +355,19 @@ local function claimMoneyTree()
     if not root then return end
     local found = CS:GetTagged("furniture:moneytree")
     if #found == 0 then
-        local placeCFrame = root.CFrame * CFrame.new(3, 0, 0)
         local result = RouterClient.get("HousingAPI/BuyFurnitures"):InvokeServer({
-            { ["kind"] = "moneytree", ["properties"] = { ["cframe"] = placeCFrame } }
+            { ["kind"] = "moneytree", ["properties"] = { ["cframe"] = root.CFrame * CFrame.new(3, 0, 0) } }
         })
         if result and result.success then task.wait(1) end
         return
     end
     for _, model in found do
-        local entry = { unique = model:GetAttribute("furniture_unique"), model = model, player = nil }
-        pcall(activateFurniture, entry)
+        pcall(activateFurniture, { unique = model:GetAttribute("furniture_unique"), model = model })
         task.wait(0.2)
     end
 end
 
--- buy + place the essential ailment furniture if the house is missing it
-local function buyEssentialFurniture()
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-    for i, kind in ipairs(ESSENTIAL_FURNITURE) do
-        if not findFurnitureByKind(root, kind) then
-            pcall(function()
-                local placeCFrame = root.CFrame * CFrame.new((i - 3) * 6, 0, -6)
-                RouterClient.get("HousingAPI/BuyFurnitures"):InvokeServer({
-                    { ["kind"] = kind, ["properties"] = { ["cframe"] = placeCFrame } }
-                })
-            end)
-            task.wait(0.4)
-        end
-    end
-end
-
--- ============================================================
--- PAYOUT
--- ============================================================
+-- payout collector
 task.spawn(function()
     while true do
         task.wait(20)
@@ -526,9 +384,7 @@ local function getEggCounts()
     local inventory = ClientData.get("inventory") or {}
     local counts, pets = {}, inventory.pets or {}
     for _, item in pairs(pets) do
-        if item.kind and item.kind:find("egg") then
-            counts[item.kind] = (counts[item.kind] or 0) + 1
-        end
+        if item.kind and item.kind:find("egg") then counts[item.kind] = (counts[item.kind] or 0) + 1 end
     end
     return counts
 end
@@ -538,40 +394,27 @@ local function buildDebug()
     local root = char and char:FindFirstChild("HumanoidRootPart")
     local pos = root and string.format("%.0f, %.0f, %.0f", root.Position.X, root.Position.Y, root.Position.Z) or "none"
     return {
-        team = tostring(ClientData.get("team")),
-        has_char = char ~= nil,
-        char_pos = pos,
-        in_house = dbgInHouse,
-        furniture = dbgFurniture,
-        task = currentStatus,
-        egg_bought = eggBoughtCount,
-        last_error = lastError,
+        team = tostring(ClientData.get("team")), has_char = char ~= nil, char_pos = pos,
+        in_house = dbgInHouse, furniture = dbgFurniture, task = currentStatus,
+        egg_bought = eggBoughtCount, last_error = lastError,
     }
 end
 
 local function sendStatus()
     pcall(function()
         local body = {
-            instance_id = INSTANCE_ID,
-            secret      = WEBHOOK_SECRET,
-            username    = LocalPlayer.Name,
-            job_id      = game.JobId,
-            bucks       = ClientData.get("money") or 0,
-            eggs        = getEggCounts(),
-            status      = currentStatus,
-            mode        = currentMode,
-            error       = lastError,
+            instance_id = INSTANCE_ID, secret = WEBHOOK_SECRET, username = LocalPlayer.Name,
+            job_id = game.JobId, bucks = ClientData.get("money") or 0, eggs = getEggCounts(),
+            status = currentStatus, mode = currentMode, error = lastError,
         }
         if debugEnabled then body.debug = buildDebug() end
         local response = HttpService:RequestAsync({
-            Url = SERVER_URL .. "/update",
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode(body),
+            Url = SERVER_URL .. "/update", Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" }, Body = HttpService:JSONEncode(body),
         })
         if response.Success then
             local data = HttpService:JSONDecode(response.Body)
-            local cmd  = data.command
+            local cmd = data.command
             if cmd then
                 if cmd == "start_farm" and not farming then startFarm()
                 elseif cmd == "stop_farm" and farming then stopFarm()
@@ -583,8 +426,7 @@ local function sendStatus()
                     local parts = cmd:split(":")
                     local target, count = parts[2], tonumber(parts[3])
                     if target and count and usernameBox and totalEggsBox and startTradeBtn then
-                        usernameBox.Text  = target
-                        totalEggsBox.Text = tostring(count)
+                        usernameBox.Text = target; totalEggsBox.Text = tostring(count)
                         if not trading then startTradeBtn.MouseButton1Click:Fire() end
                     end
                 end
@@ -594,69 +436,32 @@ local function sendStatus()
 end
 
 task.spawn(function()
-    while true do
-        task.wait(5)
-        pcall(sendStatus)
-    end
+    while true do task.wait(5); pcall(sendStatus) end
 end)
 
 -- ============================================================
--- ENSURE IN HOUSE (recovers from the void by respawning home)
+-- ENSURE IN HOUSE (respawn-home recovery)
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return end
     setFarmStatus("Going to house...")
-    pcall(function()
-        RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autofarm" })
-    end)
+    pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autofarm" }) end)
     task.wait(3)
     if isInHouse() then setFarmStatus("In house!"); return end
     local ok, InteriorsM = pcall(Fsys, "InteriorsM")
     if ok and InteriorsM then
         local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
-        if loc and loc.destination_id ~= "housing" then
-            pcall(function() InteriorsM.exit_smooth() end)
-            task.wait(2)
-        end
-        pcall(function()
-            InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer })
-        end)
-        local timeout = 0
-        while timeout < 30 do
-            task.wait(0.3); timeout = timeout + 0.3
-            if isInHouse() then setFarmStatus("In house!"); return end
-        end
-    end
-    local char     = LocalPlayer.Character
-    local root     = char and char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char and char:FindFirstChild("Humanoid")
-    if not root or not humanoid then return end
-    local door = getHouseDoor()
-    if door then
-        local touchToEnter = door:FindFirstChild("WorkingParts") and door.WorkingParts:FindFirstChild("TouchToEnter")
-        if touchToEnter then
-            local behind = touchToEnter.CFrame * CFrame.new(0, 0, 3)
-            root.CFrame = CFrame.new(behind.Position + Vector3.new(0, 3, 0))
-            task.wait(0.1)
-            humanoid:MoveTo(touchToEnter.Position)
-            task.wait(0.3)
-            root.CFrame = CFrame.new(touchToEnter.Position + Vector3.new(0, 2, 0))
-        end
-    end
-    local timeout = 0
-    while timeout < 8 do
-        task.wait(0.2); timeout = timeout + 0.2
-        if isInHouse() then setFarmStatus("In house!"); return end
+        if loc and loc.destination_id ~= "housing" then pcall(function() InteriorsM.exit_smooth() end); task.wait(2) end
+        pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
+        local t = 0
+        while t < 30 do task.wait(0.3); t = t + 0.3; if isInHouse() then setFarmStatus("In house!"); return end end
     end
 end
 
 -- ============================================================
 -- GUI HELPERS
 -- ============================================================
-local function corner(inst, r)
-    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 8); c.Parent = inst
-end
-
+local function corner(inst, r) local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 8); c.Parent = inst end
 local function label(parent, text, x, y, w, h, size, color, bold, wrap)
     local l = Instance.new("TextLabel")
     l.Position = UDim2.new(0, x, 0, y); l.Size = UDim2.new(0, w, 0, h)
@@ -666,7 +471,6 @@ local function label(parent, text, x, y, w, h, size, color, bold, wrap)
     l.TextXAlignment = Enum.TextXAlignment.Left; l.TextWrapped = wrap or false
     l.Parent = parent; return l
 end
-
 local function textbox(parent, x, y, w, h, placeholder)
     local b = Instance.new("TextBox")
     b.Position = UDim2.new(0, x, 0, y); b.Size = UDim2.new(0, w, 0, h)
@@ -676,7 +480,6 @@ local function textbox(parent, x, y, w, h, placeholder)
     b.TextSize = 12; b.Font = Enum.Font.Gotham; b.ClearTextOnFocus = false
     b.Parent = parent; corner(b, 5); return b
 end
-
 local function button(parent, text, x, y, w, h, color)
     local b = Instance.new("TextButton")
     b.Position = UDim2.new(0, x, 0, y); b.Size = UDim2.new(0, w, 0, h)
@@ -691,14 +494,12 @@ end
 -- ============================================================
 local W, H = 200, 270
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "AutoScriptGui"; screenGui.ResetOnSpawn = false
-screenGui.Parent = LocalPlayer.PlayerGui
+screenGui.Name = "AutoScriptGui"; screenGui.ResetOnSpawn = false; screenGui.Parent = LocalPlayer.PlayerGui
 
 local main = Instance.new("Frame")
 main.Size = UDim2.new(0, W, 0, H); main.Position = UDim2.new(0, 10, 0.5, -H/2)
 main.BackgroundColor3 = Color3.fromRGB(28, 28, 28); main.BorderSizePixel = 0
-main.Active = true; main.Draggable = true; main.ClipsDescendants = true
-main.Parent = screenGui; corner(main, 8)
+main.Active = true; main.Draggable = true; main.ClipsDescendants = true; main.Parent = screenGui; corner(main, 8)
 
 local titleBar = Instance.new("Frame")
 titleBar.Size = UDim2.new(1, 0, 0, 28); titleBar.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
@@ -706,25 +507,18 @@ titleBar.BorderSizePixel = 0; titleBar.Parent = main; corner(titleBar, 8)
 label(titleBar, "AutoScript", 8, 0, 140, 28, 12, Color3.fromRGB(255,255,255), true)
 
 local minimized = false
-local minBtn = button(titleBar, "-", W-46, 4, 20, 20, Color3.fromRGB(60,60,60))
-minBtn.TextSize = 11
+local minBtn = button(titleBar, "-", W-46, 4, 20, 20, Color3.fromRGB(60,60,60)); minBtn.TextSize = 11
 minBtn.MouseButton1Click:Connect(function()
     minimized = not minimized
     main.Size = UDim2.new(0, W, 0, minimized and 28 or H)
     minBtn.Text = minimized and "+" or "-"
 end)
-
-local closeBtn = button(titleBar, "X", W-24, 4, 20, 20, Color3.fromRGB(170,50,50))
-closeBtn.TextSize = 11
-closeBtn.MouseButton1Click:Connect(function()
-    farming = false; trading = false; eggBuying = false; screenGui:Destroy()
-end)
+local closeBtn = button(titleBar, "X", W-24, 4, 20, 20, Color3.fromRGB(170,50,50)); closeBtn.TextSize = 11
+closeBtn.MouseButton1Click:Connect(function() farming = false; trading = false; eggBuying = false; screenGui:Destroy() end)
 
 local tabBar = Instance.new("Frame")
 tabBar.Size = UDim2.new(1, 0, 0, 24); tabBar.Position = UDim2.new(0, 0, 0, 28)
-tabBar.BackgroundColor3 = Color3.fromRGB(22, 22, 22); tabBar.BorderSizePixel = 0
-tabBar.Parent = main
-
+tabBar.BackgroundColor3 = Color3.fromRGB(22, 22, 22); tabBar.BorderSizePixel = 0; tabBar.Parent = main
 local tabW = math.floor((W - 8) / 3)
 local tabTrade = button(tabBar, "Trade", 2, 2, tabW, 20, Color3.fromRGB(0, 150, 90))
 local tabFarm  = button(tabBar, "Farm",  4 + tabW, 2, tabW, 20, Color3.fromRGB(50, 50, 50))
@@ -734,11 +528,9 @@ tabTrade.TextSize = 10; tabFarm.TextSize = 10; tabEgg.TextSize = 10
 local tradePanel = Instance.new("Frame")
 tradePanel.Size = UDim2.new(1, 0, 1, -52); tradePanel.Position = UDim2.new(0, 0, 0, 52)
 tradePanel.BackgroundTransparency = 1; tradePanel.Parent = main
-
 local farmPanel = Instance.new("Frame")
 farmPanel.Size = UDim2.new(1, 0, 1, -52); farmPanel.Position = UDim2.new(0, 0, 0, 52)
 farmPanel.BackgroundTransparency = 1; farmPanel.Visible = false; farmPanel.Parent = main
-
 local eggPanel = Instance.new("Frame")
 eggPanel.Size = UDim2.new(1, 0, 1, -52); eggPanel.Position = UDim2.new(0, 0, 0, 52)
 eggPanel.BackgroundTransparency = 1; eggPanel.Visible = false; eggPanel.Parent = main
@@ -765,25 +557,6 @@ y = y + 38
 label(tradePanel, "Egg Type", 6, y, PW, 12, 10)
 local eggDropdown = button(tradePanel, EGG_OPTIONS[1].label, 6, y+13, PW, 22, Color3.fromRGB(50,50,50))
 eggDropdown.TextSize = 10; eggDropdown.Font = Enum.Font.Gotham
-local arrowLbl = label(eggDropdown, "v", PW-16, 0, 16, 22, 10, Color3.fromRGB(180,180,180))
-
-local dropMenu = Instance.new("Frame")
-dropMenu.Size = UDim2.new(0, PW, 0, #EGG_OPTIONS * 22); dropMenu.Position = UDim2.new(0, 6, 0, y+37)
-dropMenu.BackgroundColor3 = Color3.fromRGB(45,45,45); dropMenu.BorderSizePixel = 0
-dropMenu.Visible = false; dropMenu.ZIndex = 10; dropMenu.Parent = tradePanel; corner(dropMenu, 4)
-for i, opt in ipairs(EGG_OPTIONS) do
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, 0, 0, 22); b.Position = UDim2.new(0, 0, 0, (i-1)*22)
-    b.BackgroundTransparency = 1; b.Text = opt.label; b.TextColor3 = Color3.fromRGB(255,255,255)
-    b.TextSize = 10; b.Font = Enum.Font.Gotham; b.ZIndex = 11; b.Parent = dropMenu
-    b.MouseButton1Click:Connect(function()
-        selectedEggIndex = i; eggDropdown.Text = opt.label; dropMenu.Visible = false; arrowLbl.Text = "v"
-    end)
-end
-eggDropdown.MouseButton1Click:Connect(function()
-    dropMenu.Visible = not dropMenu.Visible; arrowLbl.Text = dropMenu.Visible and "^" or "v"
-end)
-
 y = y + 38
 label(tradePanel, "Total Eggs", 6, y, PW, 12, 10)
 totalEggsBox = textbox(tradePanel, 6, y+13, PW, 22, "e.g. 100")
@@ -792,19 +565,15 @@ local breakdownLabel = label(tradePanel, "", 6, y, PW, 20, 10, Color3.fromRGB(14
 y = y + 22
 local tradeStatusLabel = label(tradePanel, "Status: Idle", 6, y, PW, 14, 10, Color3.fromRGB(100,220,100), false, true)
 y = y + 16
-startTradeBtn = button(tradePanel, "Start Auto Trade", 6, y, PW, 26, Color3.fromRGB(0,160,90))
-startTradeBtn.TextSize = 11
+startTradeBtn = button(tradePanel, "Start Auto Trade", 6, y, PW, 26, Color3.fromRGB(0,160,90)); startTradeBtn.TextSize = 11
 
 totalEggsBox:GetPropertyChangedSignal("Text"):Connect(function()
     local n = tonumber(totalEggsBox.Text)
     if not n or n < 1 then breakdownLabel.Text = ""; return end
     n = math.floor(n)
     local batches = calcBatches(n); local rem = n % MAX_PER_TRADE
-    if rem == 0 then
-        breakdownLabel.Text = #batches .. " trades x " .. MAX_PER_TRADE .. " eggs"
-    else
-        breakdownLabel.Text = (#batches-1) .. " x " .. MAX_PER_TRADE .. "  +  1 x " .. rem .. "  =  " .. #batches .. " trades"
-    end
+    if rem == 0 then breakdownLabel.Text = #batches .. " trades x " .. MAX_PER_TRADE .. " eggs"
+    else breakdownLabel.Text = (#batches-1) .. " x " .. MAX_PER_TRADE .. "  +  1 x " .. rem end
 end)
 
 local function setTradeStatus(msg, color)
@@ -843,11 +612,11 @@ end
 
 startTradeBtn.MouseButton1Click:Connect(function()
     if trading then return end
-    local username  = usernameBox.Text
-    local eggKind   = EGG_OPTIONS[selectedEggIndex].kind
+    local username = usernameBox.Text
+    local eggKind = EGG_OPTIONS[selectedEggIndex].kind
     local totalEggs = math.floor(tonumber(totalEggsBox.Text) or 0)
     if username == "" then setTradeStatus("Enter a username!", Color3.fromRGB(255,80,80)); return end
-    if totalEggs < 1  then setTradeStatus("Enter a valid egg count!", Color3.fromRGB(255,80,80)); return end
+    if totalEggs < 1 then setTradeStatus("Enter a valid egg count!", Color3.fromRGB(255,80,80)); return end
     local target = Players:FindFirstChild(username)
     if not target then setTradeStatus("Player not found!", Color3.fromRGB(255,80,80)); return end
     if target == LocalPlayer then setTradeStatus("Can't trade yourself!", Color3.fromRGB(255,80,80)); return end
@@ -856,13 +625,9 @@ startTradeBtn.MouseButton1Click:Connect(function()
     startTradeBtn.Text = "Running..."; startTradeBtn.BackgroundColor3 = Color3.fromRGB(100,100,100)
     task.spawn(function()
         for i, batchSize in ipairs(batches) do
-            setTradeStatus("Trade " .. i .. "/" .. #batches .. " (" .. batchSize .. " eggs)")
             currentStatus = "trade " .. i .. "/" .. #batches
             local ok, err = pcall(doOneTrade, target, batchSize, eggKind)
-            if not ok then
-                setTradeStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80))
-                logErr("trade", err); break
-            end
+            if not ok then setTradeStatus("Error: " .. tostring(err):sub(1,40), Color3.fromRGB(255,80,80)); logErr("trade", err); break end
         end
         setTradeStatus("Done!", Color3.fromRGB(100,220,100))
         startTradeBtn.Text = "Start Auto Trade"; startTradeBtn.BackgroundColor3 = Color3.fromRGB(0,160,90)
@@ -875,8 +640,7 @@ end)
 -- ============================================================
 local farmStatusLabel = label(farmPanel, "Status: Idle", 6, 6,  PW, 14, 10, Color3.fromRGB(100,220,100), false, true)
 local ailmentLabel    = label(farmPanel, "",             6, 22, PW, 40, 10, Color3.fromRGB(160,160,160), false, true)
-local farmBtn = button(farmPanel, "Start AutoFarm", 6, 66, PW, 26, Color3.fromRGB(0,120,180))
-farmBtn.TextSize = 11
+local farmBtn = button(farmPanel, "Start AutoFarm", 6, 66, PW, 26, Color3.fromRGB(0,120,180)); farmBtn.TextSize = 11
 
 local function setFarmStatus(msg, color)
     currentStatus = msg
@@ -899,7 +663,6 @@ function startFarm()
     setFarmStatus("Starting..."); lastError = ""
     becomeBaby(); fillPetPen(); claimPetPen(); claimMoneyTree(); claimExtras()
     local loopCount = 0
-    local boughtFurniture = false
     farmThread = task.spawn(function()
         while farming do
             loopCount = loopCount + 1
@@ -912,112 +675,53 @@ function startFarm()
                 task.wait(0.2)
                 dbgInHouse = isInHouse()
                 dbgFurniture = countFurniture()
-                if AUTOBUY_FURNITURE and not boughtFurniture and dbgInHouse then
-                    setFarmStatus("Buying furniture...")
-                    pcall(buyEssentialFurniture)
-                    boughtFurniture = true
-                end
                 if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
                 if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
+
                 local ailments = getActiveAilments()
                 if #ailments == 0 then
                     setFarmStatus("All happy!"); ailmentLabel.Text = ""
                 else
                     local lines = {}
-                    for _, a in ipairs(ailments) do
-                        table.insert(lines, a.kind .. " " .. math.floor(a.progress*100) .. "%")
-                    end
+                    for _, a in ipairs(ailments) do table.insert(lines, a.kind .. " " .. math.floor(a.progress*100) .. "%") end
                     ailmentLabel.Text = table.concat(lines, "  |  ")
+
+                    -- pick first fixable ailment
                     local fixable = nil
                     for _, a in ipairs(ailments) do
-                        if not AILMENT_SKIP[a.kind] then fixable = a; break end
+                        if not AILMENT_SKIP[a.kind] and not AILMENT_TOOL[a.kind] then fixable = a; break end
                     end
+
                     if not fixable then
-                        setFarmStatus("No fixable ailments")
-                    elseif fixable.kind == "dirty" then
-                        setFarmStatus("Fixing: dirty (direct)")
-                        pcall(function() RouterClient.get("AilmentsAPI/ProgressDirtyAilment"):FireServer() end)
-                        task.wait(1)
+                        setFarmStatus("Nothing auto-fixable")
                     elseif fixable.kind == "pet_me" then
-                        setFarmStatus("Fixing: pet_me (direct)")
-                        local petChar = getPetChar()
+                        setFarmStatus("Fixing: pet_me")
+                        local petChar = nil
+                        for _, e in ipairs(getCharWrappers()) do if e.tag ~= "baby" and e.w.char then petChar = e.w.char; break end end
                         if petChar then
                             pcall(function() RouterClient.get("PetAPI/PetPetted"):FireServer(petChar) end)
                             pcall(function() RouterClient.get("AilmentsAPI/ProgressPetMeAilment"):FireServer() end)
                         end
                         task.wait(0.5)
-                    elseif AILMENT_MOVEMENT[fixable.kind] then
-                        if fixable.kind == "play" then
-                            setFarmStatus("Going to park for: play")
-                            local trampoline = nil
-                            local park = workspace:FindFirstChild("StaticMap") and workspace.StaticMap:FindFirstChild("Park")
-                            if park then
-                                local trampolines = park:FindFirstChild("Trampolines")
-                                if trampolines then
-                                    for _, group in pairs(trampolines:GetChildren()) do
-                                        for _, obj in ipairs(group:GetChildren()) do
-                                            if obj.Name == "Trampoline" or obj.Name == "HighTrampoline" then
-                                                trampoline = obj; break
-                                            end
-                                        end
-                                        if trampoline then break end
-                                    end
-                                end
-                            end
-                            if trampoline then
-                                local petChar = getPetChar()
-                                local petRoot = petChar and petChar:FindFirstChild("HumanoidRootPart")
-                                if petRoot then petRoot.CFrame = CFrame.new(trampoline.Position + Vector3.new(0, 4, 0)) end
-                                root.CFrame = CFrame.new(trampoline.Position + Vector3.new(3, 4, 0))
-                                local waited = 0
-                                while farming and waited < 60 do
-                                    task.wait(1); waited = waited + 1
-                                    local still = false
-                                    for _, a in ipairs(getActiveAilments()) do if a.kind == "play" then still = true; break end end
-                                    if not still then break end
-                                end
-                                ensureInHouse(setFarmStatus)
-                            else
-                                setFarmStatus("No trampoline found", Color3.fromRGB(255,200,0))
-                            end
-                        elseif fixable.kind == "walk" then
-                            setFarmStatus("Walking...")
-                            local origin = root.Position
-                            for i = 1, 16 do
-                                if not farming then break end
-                                local angle = (i / 16) * math.pi * 2
-                                local offset = Vector3.new(math.cos(angle) * 8, 0, math.sin(angle) * 8)
-                                root.CFrame = CFrame.new(origin + offset); task.wait(0.15)
-                            end
+                    elseif fixable.kind == "walk" then
+                        setFarmStatus("Walking...")
+                        local origin = root.Position
+                        for i = 1, 16 do
+                            if not farming then break end
+                            local angle = (i / 16) * math.pi * 2
+                            root.CFrame = CFrame.new(origin + Vector3.new(math.cos(angle)*8, 0, math.sin(angle)*8))
+                            task.wait(0.15)
                         end
+                    elseif fixable.kind == "play" then
+                        setFarmStatus("Fixing: play")
+                        local ok, info = fixFurnitureAilment(fixable.kind, fixable.wrapper)
+                        logErr("play", info)
                     else
+                        -- furniture ailment (sleepy/toilet/dirty/sick/...) via native FNA
                         setFarmStatus("Fixing: " .. fixable.kind)
-                        local furniture = findNearestFurniture(root, fixable.kind)
-                        if not furniture and AILMENT_USE_ID_FALLBACK[fixable.kind] then
-                            furniture = findFurnitureByKind(root, AILMENT_USE_ID_FALLBACK[fixable.kind])
-                        end
-                        if furniture then
-                            local m = furniture.model
-                            local before = root.Position
-                            local ok, info = pcall(activateFurniture, furniture)
-                            task.wait(0.3)
-                            local nr = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-                            local moved = nr and (nr.Position - before).Magnitude > 5
-                            logErr("fix " .. fixable.kind, "model=" .. (m and m.Name or "?") .. " res=" .. tostring(info) .. " moved=" .. tostring(moved))
-                            local waited = 0
-                            while farming and waited < 16 do
-                                pcall(activateFurniture, furniture)
-                                task.wait(4); waited = waited + 4
-                                local still = false
-                                for _, a in ipairs(getActiveAilments()) do
-                                    if a.kind == fixable.kind then still = true; break end
-                                end
-                                if not still then break end
-                            end
-                        else
-                            setFarmStatus("No furniture: " .. fixable.kind, Color3.fromRGB(255,200,0))
-                            logErr("findFurniture", "none for " .. fixable.kind .. " (loaded=" .. dbgFurniture .. ")")
-                        end
+                        local ok, info = fixFurnitureAilment(fixable.kind, fixable.wrapper)
+                        logErr("fix " .. fixable.kind, info)
+                        if ok then setFarmStatus("Fixed: " .. fixable.kind) end
                     end
                 end
             else
@@ -1028,9 +732,7 @@ function startFarm()
     end)
 end
 
-farmBtn.MouseButton1Click:Connect(function()
-    if farming then stopFarm() else startFarm() end
-end)
+farmBtn.MouseButton1Click:Connect(function() if farming then stopFarm() else startFarm() end end)
 
 -- ============================================================
 -- EGG PANEL
@@ -1040,7 +742,6 @@ label(eggPanel, "Select Egg", 6, ey, PW, 12, 10)
 local eggBuyDropdown = button(eggPanel, EGG_BUY_OPTIONS[1].label, 6, ey+13, PW, 22, Color3.fromRGB(50,50,50))
 eggBuyDropdown.TextSize = 10; eggBuyDropdown.Font = Enum.Font.Gotham
 local eggBuyArrow = label(eggBuyDropdown, "v", PW-16, 0, 16, 22, 10, Color3.fromRGB(180,180,180))
-
 local eggBuyDropMenu = Instance.new("Frame")
 eggBuyDropMenu.Size = UDim2.new(0, PW, 0, #EGG_BUY_OPTIONS * 20); eggBuyDropMenu.Position = UDim2.new(0, 6, 0, ey+37)
 eggBuyDropMenu.BackgroundColor3 = Color3.fromRGB(45,45,45); eggBuyDropMenu.BorderSizePixel = 0
@@ -1057,7 +758,6 @@ end
 eggBuyDropdown.MouseButton1Click:Connect(function()
     eggBuyDropMenu.Visible = not eggBuyDropMenu.Visible; eggBuyArrow.Text = eggBuyDropMenu.Visible and "^" or "v"
 end)
-
 ey = ey + 38
 label(eggPanel, "Interval (secs)", 6, ey, PW, 12, 10)
 local eggIntervalBox = textbox(eggPanel, 6, ey+13, PW, 22, "e.g. 30")
@@ -1066,8 +766,7 @@ local eggStatusLabel = label(eggPanel, "Status: Idle", 6, ey, PW, 14, 10, Color3
 ey = ey + 16
 local eggBoughtLabel = label(eggPanel, "Bought: 0", 6, ey, PW, 12, 10, Color3.fromRGB(140,200,255))
 ey = ey + 16
-local startEggBtn = button(eggPanel, "Start AutoEgg", 6, ey, PW, 26, Color3.fromRGB(180,120,0))
-startEggBtn.TextSize = 11
+local startEggBtn = button(eggPanel, "Start AutoEgg", 6, ey, PW, 26, Color3.fromRGB(180,120,0)); startEggBtn.TextSize = 11
 
 local function setEggStatus(msg, color)
     eggStatusLabel.Text = "Status: " .. msg
@@ -1075,18 +774,16 @@ local function setEggStatus(msg, color)
 end
 
 local eggThread = nil
-
 function stopEgg()
     eggBuying = false; currentMode = "idle"; currentStatus = "stopped"
     if eggThread then task.cancel(eggThread); eggThread = nil end
     startEggBtn.Text = "Start AutoEgg"; startEggBtn.BackgroundColor3 = Color3.fromRGB(180,120,0)
     setEggStatus("Stopped", Color3.fromRGB(200,100,100))
 end
-
 function startEgg()
     local interval = tonumber(eggIntervalBox.Text) or 30
     if interval < 1 then interval = 1 end
-    local eggKind     = EGG_BUY_OPTIONS[selectedEggBuyIndex].kind
+    local eggKind = EGG_BUY_OPTIONS[selectedEggBuyIndex].kind
     local eggCategory = EGG_BUY_OPTIONS[selectedEggBuyIndex].category
     eggBuying = true; currentMode = "egg"; eggBoughtCount = 0
     startEggBtn.Text = "Stop AutoEgg"; startEggBtn.BackgroundColor3 = Color3.fromRGB(170,60,60)
@@ -1103,16 +800,12 @@ function startEgg()
                 eggBoughtLabel.Text = "Bought: " .. eggBoughtCount
                 setEggStatus("Bought! Total: " .. eggBoughtCount)
             else
-                setEggStatus("Failed: " .. tostring(err):sub(1,30), Color3.fromRGB(255,200,0))
-                logErr("buyEgg", err)
+                setEggStatus("Failed: " .. tostring(err):sub(1,30), Color3.fromRGB(255,200,0)); logErr("buyEgg", err)
             end
             task.wait(interval)
         end
     end)
 end
-
-startEggBtn.MouseButton1Click:Connect(function()
-    if eggBuying then stopEgg() else startEgg() end
-end)
+startEggBtn.MouseButton1Click:Connect(function() if eggBuying then stopEgg() else startEgg() end end)
 
 switchTab("trade")
