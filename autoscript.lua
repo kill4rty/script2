@@ -416,19 +416,20 @@ task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
 -- ENSURE IN HOUSE
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
-    if isInHouse() then return end
-    setFarmStatus("Going to house...")
-    pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "autofarm" }) end)
-    task.wait(3)
-    if isInHouse() then setFarmStatus("In house!"); return end
+    if isInHouse() then return true end
+    setFarmStatus("Recovering to house...")
     local ok, IM = pcall(Fsys, "InteriorsM")
-    if ok and IM then
-        local loc = IM.get_current_location and IM.get_current_location()
-        if loc and loc.destination_id ~= "housing" then pcall(function() IM.exit_smooth() end); task.wait(2) end
-        pcall(function() IM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
+    for _ = 1, 4 do
+        if isInHouse() then return true end
+        if ok and IM then pcall(function() IM.exit_smooth() end); task.wait(1.5) end
+        pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "recover" }) end)
+        task.wait(2.5)
+        if isInHouse() then return true end
+        if ok and IM then pcall(function() IM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end) end
         local t = 0
-        while t < 30 do task.wait(0.3); t = t + 0.3; if isInHouse() then setFarmStatus("In house!"); return end end
+        while t < 8 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
     end
+    return isInHouse()
 end
 
 -- ============================================================
@@ -590,10 +591,15 @@ function startFarm()
             local char = LocalPlayer.Character
             local root = char and char:FindFirstChild("HumanoidRootPart")
             if root then
-                ensureInHouse(setFarmStatus)
+                local inHouse = ensureInHouse(setFarmStatus)
+                dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
+                if not inHouse then
+                    setFarmStatus("Stuck outside house, retrying...", Color3.fromRGB(255,200,0))
+                    task.wait(2)
+                elseif true then
                 pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
                 task.wait(0.2)
-                dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
+                    end
                 if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
                 if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
                 local ailments = getActiveAilments()
