@@ -87,12 +87,14 @@ local usernameBox, totalEggsBox, startTradeBtn
 local farming, trading, eggBuying = false, false, false
 local currentMode   = "idle"
 local currentStatus = "idle"
-local debugEnabled  = false
+local debugEnabled  = true   -- always on (no toggle)
 local lastError     = ""
+local lastFixed     = ""
 local dbgFurniture  = -1
 local dbgInHouse    = false
 local eggBoughtCount = 0
 local ailmentCooldown = {}
+local ailmentAttempts = {}   -- per-ailment fail count -> give up after 2
 
 local function logErr(where, err) lastError = tostring(where) .. ": " .. tostring(err):sub(1, 160) end
 local function countFurniture()
@@ -351,11 +353,15 @@ local function grabFreeFood(kind)   -- must be at the Hospital shop; BuyItem is 
     local t = 0; while not done and t < 5 do task.wait(0.25); t = t + 0.25 end
     return res
 end
+-- baby self-eat: equip the food (spawns a GenericTool) and ACTIVATE it (= clicking while
+-- holding), which fires the game's own consume handler. NOT feed_pet (that's a pet call).
 local function eatFood(item, wrapper)
-    pcall(function() ClientToolManager.equip(item) end); task.wait(1)
-    if _okUIH and UseItemHelper then pcall(function() UseItemHelper.use_item(wrapper, item) end) end
-    pcall(function() UIManager.apps.FocusPetApp:feed_pet(item) end)
-    pcall(function() RouterClient.get("PetAPI/ConsumeFoodObject"):FireServer(item.unique) end)   -- fallback
+    pcall(function() ClientToolManager.equip(item) end); task.wait(1.2)
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildWhichIsA("Tool")
+    if tool then
+        for _ = 1, 4 do pcall(function() tool:Activate() end); task.wait(0.5) end
+    end
 end
 local function fixBabyFeed(a)
     local kind = a.kind
@@ -371,9 +377,14 @@ local function fixBabyFeed(a)
     while farming and waited < FIX_TIMEOUT do
         eatFood(item, a.wrapper)
         task.wait(3); waited = waited + 3
-        if not ailmentStillActive(kind, a.wrapper) then if traveled then returnHome() end; return true, "fed free (" .. tostring(item.kind) .. ")" end
+        if not ailmentStillActive(kind, a.wrapper) then
+            pcall(function() ClientToolManager.unequip(item) end)   -- free the slot so the pet re-equips
+            if traveled then returnHome() end
+            return true, "fed free (" .. tostring(item.kind) .. ")"
+        end
         item = findFoodItem(kind) or item   -- grab a fresh one if the last got consumed
     end
+    pcall(function() ClientToolManager.unequip(item) end)
     if traveled then returnHome() end
     return false, kind .. " feed timeout"
 end
@@ -597,9 +608,12 @@ local function buildDebug()
     local root = char and char:FindFirstChild("HumanoidRootPart")
     local pos = root and string.format("%.0f, %.0f, %.0f", root.Position.X, root.Position.Y, root.Position.Z) or "none"
     local babyA, petA = buildAilmentLists()
+    local eqp = "NONE"
+    local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
+    if okE and eq and eq[1] then eqp = tostring(eq[1].kind) .. " a" .. tostring(eq[1].properties and eq[1].properties.age) end
     return { team = tostring(ClientData.get("team")), has_char = char ~= nil, char_pos = pos,
         in_house = dbgInHouse, furniture = dbgFurniture, task = currentStatus, egg_bought = eggBoughtCount,
-        baby_ailments = babyA, pet_ailments = petA, last_error = lastError }
+        equipped_pet = eqp, baby_ailments = babyA, pet_ailments = petA, last_fixed = lastFixed, last_error = lastError }
 end
 local function sendStatus()
     pcall(function()
@@ -840,16 +854,24 @@ function startFarm()
                             setFarmStatus("Idle (nothing to do / cooling down)")
                         else
                             setFarmStatus("Fixing: " .. (fixable.tag or "?") .. " " .. fixable.kind)
+                            local key = (fixable.tag or "?") .. ":" .. fixable.kind
                             local pok, r1, r2 = pcall(tryFixAilment, fixable)
                             local ok = pok and r1 or false
                             local info = pok and r2 or ("err: " .. tostring(r1))
-                            logErr("fix " .. fixable.kind, info)
                             if ok then
+                                lastFixed = fixable.kind .. " (" .. tostring(info) .. ")"
+                                ailmentAttempts[key] = nil
                                 setFarmStatus("Fixed: " .. fixable.kind)
                             else
-                                local key = (fixable.tag or "?") .. ":" .. fixable.kind
-                                ailmentCooldown[key] = os.time() + COOLDOWN
-                                setFarmStatus("Skip " .. fixable.kind .. " " .. COOLDOWN .. "s (" .. tostring(info) .. ")", Color3.fromRGB(255,200,0))
+                                logErr("fix " .. fixable.kind, info)   -- only real failures go to last_error
+                                ailmentAttempts[key] = (ailmentAttempts[key] or 0) + 1
+                                if ailmentAttempts[key] >= 2 then
+                                    ailmentCooldown[key] = os.time() + 300   -- 2 tries failed -> give up, move on
+                                    setFarmStatus("Gave up " .. fixable.kind .. " (2 tries)", Color3.fromRGB(255,150,0))
+                                else
+                                    ailmentCooldown[key] = os.time() + 5     -- quick retry for the 2nd try
+                                    setFarmStatus("Retry " .. fixable.kind .. " (try " .. ailmentAttempts[key] .. ")", Color3.fromRGB(255,200,0))
+                                end
                             end
                         end
                     end
