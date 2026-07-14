@@ -2,8 +2,8 @@
     AutoScript - AutoFarm + AutoTrade + AutoEgg
     Ailments: furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
     walk/ride (RateMovement), travel tasks (enter_smooth + wait). Pet equip/grow.
-    Baby feed: FREE food/water at the Hospital (FoodTray = generic_food_bowl,
-    WaterFountain = generic_water_bowl -> just furniture). Never buys, never uses stock.
+    Pen: reads idle_progression_manager (correct key). Equip skips eggs/practice pets.
+    Baby hungry/thirsty: SKIPPED (furniture can't feed babies; needs a food item - TODO).
     Anti-AFK. Self-healing cooldowns. Crash-guarded loop. Robust home recovery.
 --]]
 
@@ -50,7 +50,7 @@ local COOLDOWN           = 60
 local PET_MAX_AGE        = 6
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true }
-local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: free hospital
+local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: skipped
 local AILMENT_MOVE = { walk = true, play = true }
 -- travel tasks: enter_smooth(dest, door) -> wait -> return home
 local TRAVEL_DEST = {
@@ -170,9 +170,16 @@ end
 -- PETS
 -- ============================================================
 local function petAge(item) return (item and item.properties and item.properties.age) or 99 end
+local function isRealPet(it)
+    if type(it) ~= "table" or not it.kind then return false end
+    if it.kind:find("egg") then return false end        -- skip unhatched eggs
+    if it.kind:find("practice") then return false end   -- skip tutorial practice pet
+    return true
+end
 local function getPenUniques()
     local set = {}
-    local pen = ClientData.get("idle_progression") or {}
+    -- correct key is idle_progression_manager (was idle_progression -> always nil)
+    local pen = ClientData.get("idle_progression_manager") or {}
     for u in pairs(pen.active_pets or {}) do set[u] = true end
     return set
 end
@@ -181,7 +188,7 @@ local function pickYoungestPet(exclude)
     local pets = (ClientData.get("inventory") or {}).pets or {}
     local best, bestAge
     for u, it in pairs(pets) do
-        if type(it) == "table" and not pen[u] and u ~= exclude then
+        if isRealPet(it) and not pen[u] and u ~= exclude then
             it.unique = it.unique or u
             local age = petAge(it)
             if age < PET_MAX_AGE and (not best or age < bestAge) then best, bestAge = it, age end
@@ -397,58 +404,6 @@ local function fixTravel(a)
     return done, done and "traveled" or "travel timeout"
 end
 
--- baby hungry/thirsty: the Hospital FoodTray (generic_food_bowl) and WaterFountain
--- (generic_water_bowl) are just FURNITURE - same use_ids as pet bowls. So: travel there,
--- stream the fixtures in, wait until the furniture registers, run the proven furniture fix.
--- Free, no stock, no buying. (The WaterCooler model is decorative/use_id=nil - ignore it.)
-local function fixBabyFeed(a)
-    pcall(function() InteriorsM.enter_smooth("Hospital", "MainDoor", {}) end)
-    task.wait(3)
-    -- stream hospital fixtures in and wait until find_furniture_position sees the tray/fountain
-    local hasFurn = false
-    for _ = 1, 12 do
-        local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if root then pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end) end
-        local pos
-        pcall(function() pos = AFH.find_furniture_position(a.kind) end)
-        if pos then hasFurn = true; break end
-        task.wait(1)
-    end
-    if hasFurn then
-        local ok, info = fixFurnitureAilment(a.kind, a.wrapper)
-        returnHome()
-        return ok, "hospital " .. tostring(info)
-    end
-    -- fallback: locate the fixture model by name and drive the FNA directly
-    -- (WaterCooler is decorative/use_id=nil; the real drink source is the WaterFountain)
-    local want = a.kind == "thirsty" and "WaterFountain" or "FoodTray"
-    local fixture
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Model") and d.Name:find(want) then fixture = d break end
-    end
-    local target = fixture and (fixture:FindFirstChild("UseBlock", true) or fixture.PrimaryPart or fixture:FindFirstChildWhichIsA("BasePart"))
-    if not target then returnHome(); return false, "no " .. want .. " at hospital" end
-    local function park()
-        local r = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if r then r.CFrame = CFrame.new(target.Position + Vector3.new(0, 3, 0)) end
-    end
-    park(); task.wait(1.5)
-    local action = FNA.new({ ailment_to_boost = a.kind })
-    if not action:get_valid_interaction() then returnHome(); return false, "no interaction at " .. want end
-    pcall(function() action:automatically_use_nearby_furniture(a.wrapper) end)
-    local waited = 0
-    while farming and waited < FIX_TIMEOUT do
-        task.wait(2); waited = waited + 2
-        local r = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if r and r.Parent and (r.Position - target.Position).Magnitude > 12 then park() end
-        if not ailmentStillActive(a.kind, a.wrapper) then
-            pcall(function() action:stop() end); returnHome(); return true, "fed free at hospital in " .. waited .. "s"
-        end
-    end
-    pcall(function() action:stop() end); returnHome()
-    return false, "hospital feed timeout"
-end
-
 local function tryFixAilment(a)
     if a.kind == "pet_me" then return fixPetMe(a)
     elseif a.kind == "mystery" then return fixMystery(a)
@@ -457,8 +412,10 @@ local function tryFixAilment(a)
     elseif AILMENT_MOVE[a.kind] then return fixMove(a)
     elseif AILMENT_FURNITURE[a.kind] then return fixFurnitureAilment(a.kind, a.wrapper)
     elseif AILMENT_FEED[a.kind] then
+        -- pets eat/drink from bowls (furniture); babies need a food ITEM which we
+        -- don't have a free source for yet -> skip baby feed instead of wasting trips.
         if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end
-        return fixBabyFeed(a)   -- baby: free food/water at the Hospital
+        return false, "baby feed skipped (needs food item)"
     end
     return false, "no handler"
 end
@@ -467,7 +424,7 @@ local function isHandled(a)
     if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
-    if AILMENT_FEED[a.kind] then return true end   -- pet: bowl; baby: free hospital
+    if AILMENT_FEED[a.kind] then return a.tag == "pet" end   -- baby feed not handled (skipped)
     return false
 end
 
@@ -507,7 +464,9 @@ local function claimExtras()
     tryRemote("HousingAPI/ClaimAllDeliveries"); tryRemote("LootBoxAPI/ClaimLoginHandouts")
 end
 local function fillPetPen()
-    local penData = ClientData.get("idle_progression") or {}
+    -- correct key is idle_progression_manager (was idle_progression -> always nil,
+    -- which made this think the pen was empty and spam AddPet for penned pets)
+    local penData = ClientData.get("idle_progression_manager") or {}
     local activePets = penData.active_pets or {}
     local count = 0; for _ in pairs(activePets) do count = count + 1 end
     if count >= 4 then return end
@@ -515,14 +474,14 @@ local function fillPetPen()
     local added = 0
     for unique, it in pairs(pets) do
         if count + added >= 4 then break end
-        if type(it) == "table" and not activePets[unique] and petAge(it) >= PET_MAX_AGE then
+        if isRealPet(it) and not activePets[unique] and petAge(it) >= PET_MAX_AGE then
             RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1)
         end
     end
     if count + added < 4 then
         for unique, it in pairs(pets) do
             if count + added >= 4 then break end
-            if type(it) == "table" and not activePets[unique] then RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1) end
+            if isRealPet(it) and not activePets[unique] then RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1) end
         end
     end
 end
