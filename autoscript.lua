@@ -2,7 +2,7 @@
     AutoScript - AutoFarm + AutoTrade + AutoEgg
     Ailments: furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
     walk/ride (RateMovement), travel tasks (enter_smooth + wait). Pet equip/grow.
-    Baby feed: FREE food/water at the Hospital (WaterCooler / FoodTray).
+    Baby feed: FREE food/water at the Hospital (FoodTray/WaterCooler = furniture).
     Anti-AFK. Self-healing cooldowns. Crash-guarded loop. Robust home recovery.
 --]]
 
@@ -396,11 +396,28 @@ local function fixTravel(a)
     return done, done and "traveled" or "travel timeout"
 end
 
--- baby hungry/thirsty: travel to Hospital, use the FREE WaterCooler / FoodTray
--- (both are furniture with UseBlocks -> same FNA flow). Never buys, never uses stock.
+-- baby hungry/thirsty: the Hospital FoodTray (use_id generic_food_bowl) and WaterCooler
+-- are just FURNITURE - same use_id as a pet bowl. So: travel there, stream the fixtures
+-- in, wait until the furniture registers, then run the proven furniture fix. Free, no stock.
 local function fixBabyFeed(a)
     pcall(function() InteriorsM.enter_smooth("Hospital", "MainDoor", {}) end)
     task.wait(3)
+    -- stream hospital fixtures in and wait until find_furniture_position sees the tray/cooler
+    local hasFurn = false
+    for _ = 1, 12 do
+        local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if root then pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end) end
+        local pos
+        pcall(function() pos = AFH.find_furniture_position(a.kind) end)
+        if pos then hasFurn = true; break end
+        task.wait(1)
+    end
+    if hasFurn then
+        local ok, info = fixFurnitureAilment(a.kind, a.wrapper)
+        returnHome()
+        return ok, "hospital " .. tostring(info)
+    end
+    -- fallback: locate the fixture model by name and drive the FNA directly
     local want = a.kind == "thirsty" and "WaterCooler" or "FoodTray"
     local fixture
     for _, d in ipairs(workspace:GetDescendants()) do
