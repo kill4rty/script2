@@ -1,8 +1,8 @@
 --[[
     AutoScript - AutoFarm + AutoTrade + AutoEgg
-    Ailments: baby+pet furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
-    walk/ride (RateMovement). Auto-equips + grows pets. Anti-AFK. Self-healing cooldowns.
-    Travel-based tasks (sick/food/pizza/camping/balloon_fight) not yet handled.
+    Ailments: furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
+    walk/ride (RateMovement), travel tasks (enter_smooth + wait). Pet equip/grow.
+    Anti-AFK. Self-healing cooldowns. Crash-guarded loop.
 --]]
 
 local Players     = game:GetService("Players")
@@ -12,7 +12,6 @@ local RS          = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
--- Anti-AFK
 LocalPlayer.Idled:Connect(function()
     pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
 end)
@@ -26,6 +25,7 @@ local CharWrapperClient = Fsys("CharWrapperClient")
 local ClientToolManager = Fsys("ClientToolManager")
 local UIManager         = Fsys("UIManager")
 local PetEntityHelper   = Fsys("PetEntityHelper")
+local InteriorsM        = Fsys("InteriorsM")
 local _okPPN, PetPerformanceName = pcall(Fsys, "PetPerformanceName")
 
 local FNA = require(RS.new.modules.Ailments.ClientActions.FurnitureNavigationAction)
@@ -41,14 +41,25 @@ local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
 
 local FARM_LOOP_INTERVAL = 0.5
 local MONEYTREE_EVERY    = 600
-local FIX_TIMEOUT        = 30   -- furniture fix time budget
-local MOVE_TIME          = 34   -- walk/ride movement duration (RateMovement total_time is 30)
-local COOLDOWN           = 60   -- skip a failed need for this long
-local PET_MAX_AGE        = 6    -- Full Grown = skip/rotate
+local FIX_TIMEOUT        = 30
+local MOVE_TIME          = 34
+local TRAVEL_TIME        = 56   -- location tasks: total_time 50 + buffer
+local COOLDOWN           = 60
+local PET_MAX_AGE        = 6
 
-local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true, sick = true }
+local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true }
 local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: disabled
-local AILMENT_MOVE = { walk = true, play = true }       -- RateMovement: move around
+local AILMENT_MOVE = { walk = true, play = true }
+-- travel tasks: enter_smooth(dest, door) -> wait -> return home
+local TRAVEL_DEST = {
+    pizza_party   = { dest = "PizzaShop", door = "MainDoor" },
+    school        = { dest = "School",    door = "MainDoor" },
+    salon         = { dest = "Salon",     door = "MainDoor" },
+    sick          = { dest = "Hospital",  door = "MainDoor" },
+    camping       = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
+    balloon_fight = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
+    beach_party   = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
+}
 
 local startFarm, stopFarm, startEgg, stopEgg
 local usernameBox, totalEggsBox, startTradeBtn
@@ -67,7 +78,6 @@ local eggBoughtCount = 0
 local ailmentCooldown = {}
 
 local function logErr(where, err) lastError = tostring(where) .. ": " .. tostring(err):sub(1, 160) end
-
 local function countFurniture()
     local okF, FMT = pcall(Fsys, "FurnitureModelTracker")
     if okF and FMT then
@@ -77,9 +87,7 @@ local function countFurniture()
     return 0
 end
 local function isInHouse()
-    local ok, IM = pcall(Fsys, "InteriorsM")
-    if not ok or not IM then return false end
-    local loc = IM.get_current_location and IM.get_current_location()
+    local loc = InteriorsM.get_current_location and InteriorsM.get_current_location()
     return loc ~= nil and loc.destination_id == "housing"
 end
 
@@ -136,9 +144,7 @@ local function getEggUniques(eggKind, count)
     end
     return found
 end
-local function waitForTradeStateClear()
-    local e = 0; while e < MAX_WAIT_STATE do if ClientData.get("trade") == nil then return true end task.wait(0.25); e = e + 0.25 end; return false
-end
+local function waitForTradeStateClear() local e = 0; while e < MAX_WAIT_STATE do if ClientData.get("trade") == nil then return true end task.wait(0.25); e = e + 0.25 end; return false end
 local function waitForNewNegotiationStage(lastId)
     local e = 0
     while e < MAX_WAIT_STATE do
@@ -159,7 +165,7 @@ local function waitForConfirmationStage(tradeId)
 end
 
 -- ============================================================
--- PETS: equip youngest non-adult, skip pen pets, rotate at Full Grown
+-- PETS
 -- ============================================================
 local function petAge(item) return (item and item.properties and item.properties.age) or 99 end
 local function getPenUniques()
@@ -246,10 +252,14 @@ local function ailmentStillActive(kind, wrapper)
     return false
 end
 
+local function returnHome()
+    pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
+    task.wait(2)
+end
+
 -- ============================================================
 -- FIX HANDLERS
 -- ============================================================
--- furniture (baby or pet): position ailing char on furniture, native FNA use
 local function fixFurnitureAilment(kind, wrapper)
     local pos
     pcall(function() pos = AFH.find_furniture_position(kind) end)
@@ -259,10 +269,10 @@ local function fixFurnitureAilment(kind, wrapper)
     elseif typeof(pos) == "CFrame" then target = pos.Position
     elseif type(pos) == "table" and pos.Position then target = pos.Position end
     if not target then return false, "bad furniture pos" end
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     local ailingChar = wrapper and wrapper.char
     local isPet = ailingChar and ailingChar ~= LocalPlayer.Character
     local function park()
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
         if myRoot then myRoot.CFrame = CFrame.new(target + Vector3.new(0, 3, 0)) end
         if isPet then local pr = ailingChar:FindFirstChild("HumanoidRootPart"); if pr then pr.CFrame = CFrame.new(target + Vector3.new(2.5, 3, 0)) end end
     end
@@ -272,14 +282,19 @@ local function fixFurnitureAilment(kind, wrapper)
     pcall(function() action:automatically_use_nearby_furniture(wrapper) end)
     local waited = 0
     while farming and waited < FIX_TIMEOUT do
-        task.wait(2); waited = waited + 2; park()
+        task.wait(2); waited = waited + 2
+        -- only re-park if something drifted off (don't interrupt an in-progress use)
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local dDrift = (myRoot and myRoot.Parent) and (myRoot.Position - target).Magnitude or 0
+        local pr = isPet and ailingChar and ailingChar:FindFirstChild("HumanoidRootPart")
+        local pDrift = pr and (pr.Position - target).Magnitude or 0
+        if dDrift > 12 or pDrift > 12 then park() end
         if not ailmentStillActive(kind, wrapper) then pcall(function() action:stop() end); return true, "fixed in " .. waited .. "s" end
     end
     pcall(function() action:stop() end)
     return false, "timeout after " .. waited .. "s"
 end
 
--- pet_me: focus pet -> stage Petting performance -> fire completion
 local function fixPetMe(a)
     local pu, pchar = a.wrapper.pet_unique, a.wrapper.char
     if not pu or not pchar then return false, "no pet unique/char" end
@@ -300,7 +315,6 @@ local function fixPetMe(a)
     return not ailmentStillActive("pet_me", a.wrapper), "petted"
 end
 
--- mystery: roll slots, choose a fixable one -> becomes a real need
 local function fixMystery(a)
     local action = a.obj.action
     if not action or not action._get_ailment_slots then return false, "no mystery action" end
@@ -316,26 +330,26 @@ local function fixMystery(a)
     return not ailmentStillActive("mystery", a.wrapper), "chose " .. tostring(kind)
 end
 
--- walk/play: RateMovement -> move the ailing char (and player) around
 local function fixMove(a)
     local ailChar = (a.wrapper and a.wrapper.char) or LocalPlayer.Character
     local root = ailChar and ailChar:FindFirstChild("HumanoidRootPart")
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not root then return false, "no root" end
     local origin = root.Position
     local startT, i = tick(), 0
     while farming and tick() - startT < MOVE_TIME do
         i = i + 1
+        root = ailChar and ailChar:FindFirstChild("HumanoidRootPart")
+        if not root or not root.Parent then break end
         local off = Vector3.new(math.cos(i * 0.4) * 5, 0, math.sin(i * 0.4) * 5)
         root.CFrame = CFrame.new(origin + off)
-        if myRoot and myRoot ~= root then myRoot.CFrame = CFrame.new(origin + off + Vector3.new(2.5, 0, 0)) end
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if myRoot and myRoot.Parent and myRoot ~= root then myRoot.CFrame = CFrame.new(origin + off + Vector3.new(2.5, 0, 0)) end
         task.wait(0.2)
         if not ailmentStillActive(a.kind, a.wrapper) then return true, "moved" end
     end
     return not ailmentStillActive(a.kind, a.wrapper), "move timeout"
 end
 
--- ride: equip a stroller/transport (valid state) then move (RateMovement, ~30s)
 local function fixRide(a)
     local inv = ClientData.get("inventory") or {}
     local item
@@ -352,23 +366,79 @@ local function fixRide(a)
     return fixMove(a)
 end
 
+-- travel task: enter_smooth to destination -> move/wait -> return home
+local function fixTravel(a)
+    local d = TRAVEL_DEST[a.kind]
+    if not d then return false, "no dest" end
+    pcall(function() InteriorsM.enter_smooth(d.dest, d.door, {}) end)
+    task.wait(3)
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local origin = root and root.Position
+    local startT, i = tick(), 0
+    while farming and tick() - startT < TRAVEL_TIME do
+        i = i + 1
+        root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if root and root.Parent and origin then root.CFrame = CFrame.new(origin + Vector3.new(math.cos(i * 0.4) * 4, 0, math.sin(i * 0.4) * 4)) end
+        task.wait(0.3)
+        if not ailmentStillActive(a.kind, a.wrapper) then break end
+    end
+    local done = not ailmentStillActive(a.kind, a.wrapper)
+    returnHome()
+    return done, done and "traveled" or "travel timeout"
+end
+
+-- baby hungry/thirsty: travel to Hospital, use the FREE WaterCooler / FoodTray
+-- (both are furniture with UseBlocks -> same FNA flow). Never buys, never uses stock.
+local function fixBabyFeed(a)
+    pcall(function() InteriorsM.enter_smooth("Hospital", "MainDoor", {}) end)
+    task.wait(3)
+    local want = a.kind == "thirsty" and "WaterCooler" or "FoodTray"
+    local fixture
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Model") and d.Name:find(want) then fixture = d break end
+    end
+    local target = fixture and (fixture:FindFirstChild("UseBlock", true) or fixture.PrimaryPart or fixture:FindFirstChildWhichIsA("BasePart"))
+    if not target then returnHome(); return false, "no " .. want .. " at hospital" end
+    local function park()
+        local r = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if r then r.CFrame = CFrame.new(target.Position + Vector3.new(0, 3, 0)) end
+    end
+    park(); task.wait(1.5)
+    local action = FNA.new({ ailment_to_boost = a.kind })
+    if not action:get_valid_interaction() then returnHome(); return false, "no interaction at " .. want end
+    pcall(function() action:automatically_use_nearby_furniture(a.wrapper) end)
+    local waited = 0
+    while farming and waited < FIX_TIMEOUT do
+        task.wait(2); waited = waited + 2
+        local r = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if r and r.Parent and (r.Position - target.Position).Magnitude > 12 then park() end
+        if not ailmentStillActive(a.kind, a.wrapper) then
+            pcall(function() action:stop() end); returnHome(); return true, "fed free at hospital in " .. waited .. "s"
+        end
+    end
+    pcall(function() action:stop() end); returnHome()
+    return false, "hospital feed timeout"
+end
+
 local function tryFixAilment(a)
     if a.kind == "pet_me" then return fixPetMe(a)
     elseif a.kind == "mystery" then return fixMystery(a)
     elseif a.kind == "ride" then return fixRide(a)
+    elseif TRAVEL_DEST[a.kind] then return fixTravel(a)
     elseif AILMENT_MOVE[a.kind] then return fixMove(a)
     elseif AILMENT_FURNITURE[a.kind] then return fixFurnitureAilment(a.kind, a.wrapper)
     elseif AILMENT_FEED[a.kind] then
         if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end
-        return false, "baby feed disabled"
+        return fixBabyFeed(a)   -- baby: free food/water at the Hospital
     end
-    return false, "no handler (travel/other)"
+    return false, "no handler"
 end
 local function isHandled(a)
     if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" then return true end
+    if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
-    if AILMENT_FEED[a.kind] then return a.tag == "pet" end
+    if AILMENT_FEED[a.kind] then return true end   -- pet: bowl; baby: free hospital
     return false
 end
 
@@ -412,7 +482,6 @@ local function fillPetPen()
     local activePets = penData.active_pets or {}
     local count = 0; for _ in pairs(activePets) do count = count + 1 end
     if count >= 4 then return end
-    -- prefer Full Grown pets for the pen (passive income); leave young ones to equip/grow
     local pets = (ClientData.get("inventory") or {}).pets or {}
     local added = 0
     for unique, it in pairs(pets) do
@@ -521,14 +590,13 @@ task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return true end
     setFarmStatus("Recovering to house...")
-    local ok, IM = pcall(Fsys, "InteriorsM")
     for _ = 1, 4 do
         if isInHouse() then return true end
-        if ok and IM then pcall(function() IM.exit_smooth() end); task.wait(1.5) end
+        pcall(function() InteriorsM.exit_smooth() end); task.wait(1.5)
         pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "recover" }) end)
         task.wait(2.5)
         if isInHouse() then return true end
-        if ok and IM then pcall(function() IM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end) end
+        pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
         local t = 0
         while t < 8 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
     end
@@ -606,7 +674,6 @@ tabFarm.MouseButton1Click:Connect(function()  switchTab("farm")  end)
 tabEgg.MouseButton1Click:Connect(function()   switchTab("egg")   end)
 local PW = W - 12
 
--- TRADE PANEL
 local y = 4
 label(tradePanel, "Username", 6, y, PW, 12, 10)
 usernameBox = textbox(tradePanel, 6, y+13, PW, 22, "e.g. AltAccount123")
@@ -669,7 +736,6 @@ startTradeBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
--- FARM PANEL
 local farmStatusLabel = label(farmPanel, "Status: Idle", 6, 6,  PW, 14, 10, Color3.fromRGB(100,220,100), false, true)
 local ailmentLabel    = label(farmPanel, "",             6, 22, PW, 40, 10, Color3.fromRGB(160,160,160), false, true)
 local farmBtn = button(farmPanel, "Start AutoFarm", 6, 66, PW, 26, Color3.fromRGB(0,120,180)); farmBtn.TextSize = 11
@@ -689,60 +755,64 @@ function startFarm()
     local loopCount = 0
     farmThread = task.spawn(function()
         while farming do
-            loopCount = loopCount + 1
-            if loopCount % 60 == 0 then pcall(claimExtras) end
-            local char = LocalPlayer.Character
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if not root then
-                setFarmStatus("No character", Color3.fromRGB(255,200,0))
-            elseif not ensureInHouse(setFarmStatus) then
-                dbgInHouse = false; dbgFurniture = countFurniture()
-                setFarmStatus("Stuck outside house, retrying...", Color3.fromRGB(255,200,0))
-                task.wait(2)
-            else
-                pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
-                task.wait(0.2)
-                dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
-                pcall(ensurePetEquipped)
-                if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
-                if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
-                local ailments = getActiveAilments()
-                if #ailments == 0 then
-                    setFarmStatus("All happy!"); ailmentLabel.Text = ""
+            local lok, lerr = pcall(function()
+                loopCount = loopCount + 1
+                if loopCount % 60 == 0 then pcall(claimExtras) end
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then
+                    setFarmStatus("No character", Color3.fromRGB(255,200,0))
+                elseif not ensureInHouse(setFarmStatus) then
+                    dbgInHouse = false; dbgFurniture = countFurniture()
+                    setFarmStatus("Stuck outside house, retrying...", Color3.fromRGB(255,200,0))
+                    task.wait(2)
                 else
-                    local lines = {}
-                    for _, a in ipairs(ailments) do table.insert(lines, a.kind .. " " .. math.floor(a.progress*100) .. "%") end
-                    ailmentLabel.Text = table.concat(lines, "  |  ")
-                    local now = os.time()
-                    local fixable = nil
-                    for _, a in ipairs(ailments) do
-                        local key = (a.tag or "?") .. ":" .. a.kind
-                        local cd = ailmentCooldown[key]
-                        if isHandled(a) and not (cd and now < cd) then fixable = a; break end
-                    end
-                    if not fixable then
-                        setFarmStatus("Idle (nothing to do / cooling down)")
+                    pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
+                    task.wait(0.2)
+                    dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
+                    pcall(ensurePetEquipped)
+                    if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
+                    if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
+                    local ailments = getActiveAilments()
+                    if #ailments == 0 then
+                        setFarmStatus("All happy!"); ailmentLabel.Text = ""
                     else
-                        setFarmStatus("Fixing: " .. (fixable.tag or "?") .. " " .. fixable.kind)
-                        local ok, info = tryFixAilment(fixable)
-                        logErr("fix " .. fixable.kind, info)
-                        if ok then
-                            setFarmStatus("Fixed: " .. fixable.kind)
+                        local lines = {}
+                        for _, a in ipairs(ailments) do table.insert(lines, a.kind .. " " .. math.floor(a.progress*100) .. "%") end
+                        ailmentLabel.Text = table.concat(lines, "  |  ")
+                        local now = os.time()
+                        local fixable = nil
+                        for _, a in ipairs(ailments) do
+                            local key = (a.tag or "?") .. ":" .. a.kind
+                            local cd = ailmentCooldown[key]
+                            if isHandled(a) and not (cd and now < cd) then fixable = a; break end
+                        end
+                        if not fixable then
+                            setFarmStatus("Idle (nothing to do / cooling down)")
                         else
-                            local key = (fixable.tag or "?") .. ":" .. fixable.kind
-                            ailmentCooldown[key] = os.time() + COOLDOWN
-                            setFarmStatus("Skip " .. fixable.kind .. " " .. COOLDOWN .. "s (" .. tostring(info) .. ")", Color3.fromRGB(255,200,0))
+                            setFarmStatus("Fixing: " .. (fixable.tag or "?") .. " " .. fixable.kind)
+                            local pok, r1, r2 = pcall(tryFixAilment, fixable)
+                            local ok = pok and r1 or false
+                            local info = pok and r2 or ("err: " .. tostring(r1))
+                            logErr("fix " .. fixable.kind, info)
+                            if ok then
+                                setFarmStatus("Fixed: " .. fixable.kind)
+                            else
+                                local key = (fixable.tag or "?") .. ":" .. fixable.kind
+                                ailmentCooldown[key] = os.time() + COOLDOWN
+                                setFarmStatus("Skip " .. fixable.kind .. " " .. COOLDOWN .. "s (" .. tostring(info) .. ")", Color3.fromRGB(255,200,0))
+                            end
                         end
                     end
                 end
-            end
+            end)
+            if not lok then logErr("loop", lerr) end
             task.wait(FARM_LOOP_INTERVAL)
         end
     end)
 end
 farmBtn.MouseButton1Click:Connect(function() if farming then stopFarm() else startFarm() end end)
 
--- EGG PANEL
 local ey = 4
 label(eggPanel, "Select Egg", 6, ey, PW, 12, 10)
 local eggBuyDropdown = button(eggPanel, EGG_BUY_OPTIONS[1].label, 6, ey+13, PW, 22, Color3.fromRGB(50,50,50))
