@@ -2,7 +2,8 @@
     AutoScript - AutoFarm + AutoTrade + AutoEgg
     Ailments: furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
     walk/ride (RateMovement), travel tasks (enter_smooth + wait). Pet equip/grow.
-    Anti-AFK. Self-healing cooldowns. Crash-guarded loop.
+    Baby feed: FREE food/water at the Hospital (WaterCooler / FoodTray).
+    Anti-AFK. Self-healing cooldowns. Crash-guarded loop. Robust home recovery.
 --]]
 
 local Players     = game:GetService("Players")
@@ -48,7 +49,7 @@ local COOLDOWN           = 60
 local PET_MAX_AGE        = 6
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true }
-local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: disabled
+local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: free hospital
 local AILMENT_MOVE = { walk = true, play = true }
 -- travel tasks: enter_smooth(dest, door) -> wait -> return home
 local TRAVEL_DEST = {
@@ -252,9 +253,17 @@ local function ailmentStillActive(kind, wrapper)
     return false
 end
 
+-- robust: get back into the house, verify, retry with both methods
 local function returnHome()
-    pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
-    task.wait(2)
+    for _ = 1, 4 do
+        if isInHouse() then return true end
+        pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
+        local t = 0
+        while t < 6 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
+        pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "returnhome" }) end)
+        task.wait(2)
+    end
+    return isInHouse()
 end
 
 -- ============================================================
@@ -585,20 +594,23 @@ end
 task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
 
 -- ============================================================
--- ENSURE IN HOUSE
+-- ENSURE IN HOUSE (robust: respawn-home first, then smooth enter, then exit as last resort)
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return true end
     setFarmStatus("Recovering to house...")
-    for _ = 1, 4 do
+    for _ = 1, 6 do
         if isInHouse() then return true end
-        pcall(function() InteriorsM.exit_smooth() end); task.wait(1.5)
+        -- proven method first: force respawn at home (works even when floating in the world)
         pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "recover" }) end)
         task.wait(2.5)
         if isInHouse() then return true end
+        -- smooth enter into own house
         pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
         local t = 0
-        while t < 8 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
+        while t < 6 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
+        -- last resort: leave whatever interior we're stuck in, then retry
+        pcall(function() InteriorsM.exit_smooth() end); task.wait(1.5)
     end
     return isInHouse()
 end
