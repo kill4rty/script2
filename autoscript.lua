@@ -1,10 +1,14 @@
 --[[
     AutoScript - AutoFarm + AutoTrade + AutoEgg
-    Ailments: furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
-    walk/ride (RateMovement), travel tasks (enter_smooth + wait). Pet equip/grow.
-    Pen: reads idle_progression_manager (correct key). Equip skips eggs/practice pets.
-    Baby hungry/thirsty: SKIPPED (furniture can't feed babies; needs a food item - TODO).
-    Anti-AFK. Self-healing cooldowns. Crash-guarded loop. Robust home recovery.
+    Ailments: furniture (FNA), pet_me, mystery, walk/ride, travel tasks.
+    Baby hungry/thirsty/sick: grab FREE food from the Hospital (ShopAPI/BuyItem "food",
+    cost 0) -> equip -> eat (UseItemHelper.use_item, ConsumeFoodObject fallback).
+      water -> thirsty, healing_apple -> sick, sandwich/any food -> hungry.
+    Pet grow: equip youngest pet/egg (no kind filter), swap at age 6, buy cracked egg
+      when nothing to grow (only if bucks >= MIN_BUCKS_FOR_EGG).
+    Pen: reads idle_progression_manager (correct key).
+    Retry-until-done: handlers re-attempt the action each cycle instead of one-shot.
+    Anti-AFK. Crash-guarded loop. Robust home recovery.
 --]]
 
 local Players     = game:GetService("Players")
@@ -33,6 +37,7 @@ local _okPPN, PetPerformanceName = pcall(Fsys, "PetPerformanceName")
 local FNA = require(RS.new.modules.Ailments.ClientActions.FurnitureNavigationAction)
 local AFH = require(RS.new.modules.Ailments.Helpers.AilmentsFurnitureHelper)
 local PetEntityManager = require(RS.ClientModules.Game.PetEntities.PetEntityManager)
+local _okUIH, UseItemHelper = pcall(function() return require(RS.new.modules.Ailments.Helpers.UseItemHelper) end)
 
 -- ============================================================
 -- CONFIG
@@ -43,21 +48,31 @@ local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
 
 local FARM_LOOP_INTERVAL = 0.5
 local MONEYTREE_EVERY    = 600
-local FIX_TIMEOUT        = 30
+local FIX_TIMEOUT        = 40
 local MOVE_TIME          = 34
-local TRAVEL_TIME        = 56   -- location tasks: total_time 50 + buffer
-local COOLDOWN           = 60
+local TRAVEL_TIME        = 56
+local COOLDOWN           = 20   -- shorter so failed fixes retry sooner (retry-until-done)
 local PET_MAX_AGE        = 6
+local MIN_BUCKS_FOR_EGG  = 1000 -- only auto-buy a cracked egg (350) if you have at least this much
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true }
-local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: skipped
+local AILMENT_FEED = { hungry = true, thirsty = true, sick = true }  -- baby: eat free food; pet: bowl (hungry/thirsty)
 local AILMENT_MOVE = { walk = true, play = true }
--- travel tasks: enter_smooth(dest, door) -> wait -> return home
+
+-- baby feed: free grab kind + which inventory kinds satisfy each ailment
+local FEED_GRAB = { hungry = "schospital_refresh_2023_cafeteria_sandwich", thirsty = "water", sick = "healing_apple" }
+local FEED_MATCH = {
+    thirsty = function(k) return k == "water" end,
+    sick    = function(k) return k == "healing_apple" end,
+    hungry  = function(k) return k ~= "water" and k ~= "healing_apple"
+        and not k:find("potion") and not k:find("bait") and not k:find("rod") and not k:find("temporary") end,
+}
+
+-- travel tasks: enter_smooth(dest, door) -> wait -> return home  (sick handled by feed, not here)
 local TRAVEL_DEST = {
     pizza_party   = { dest = "PizzaShop", door = "MainDoor" },
     school        = { dest = "School",    door = "MainDoor" },
     salon         = { dest = "Salon",     door = "MainDoor" },
-    sick          = { dest = "Hospital",  door = "MainDoor" },
     camping       = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
     balloon_fight = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
     beach_party   = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
@@ -170,25 +185,20 @@ end
 -- PETS
 -- ============================================================
 local function petAge(item) return (item and item.properties and item.properties.age) or 99 end
-local function isRealPet(it)
-    if type(it) ~= "table" or not it.kind then return false end
-    if it.kind:find("egg") then return false end        -- skip unhatched eggs
-    if it.kind:find("practice") then return false end   -- skip tutorial practice pet
-    return true
-end
+local function isEgg(kind) return kind ~= nil and kind:match("egg$") ~= nil end   -- actual unhatched egg (ends in "egg")
 local function getPenUniques()
     local set = {}
-    -- correct key is idle_progression_manager (was idle_progression -> always nil)
-    local pen = ClientData.get("idle_progression_manager") or {}
+    local pen = ClientData.get("idle_progression_manager") or {}   -- correct key
     for u in pairs(pen.active_pets or {}) do set[u] = true end
     return set
 end
+-- youngest thing to grow: any pet OR egg, not in pen, under age 6 (egg vs pet - no difference)
 local function pickYoungestPet(exclude)
     local pen = getPenUniques()
     local pets = (ClientData.get("inventory") or {}).pets or {}
     local best, bestAge
     for u, it in pairs(pets) do
-        if isRealPet(it) and not pen[u] and u ~= exclude then
+        if type(it) == "table" and it.kind and not pen[u] and u ~= exclude then
             it.unique = it.unique or u
             local age = petAge(it)
             if age < PET_MAX_AGE and (not best or age < bestAge) then best, bestAge = it, age end
@@ -196,14 +206,21 @@ local function pickYoungestPet(exclude)
     end
     return best
 end
+local function buyCrackedEgg()
+    local money = ClientData.get("money") or 0
+    if money < MIN_BUCKS_FOR_EGG then return false end
+    return pcall(function() RouterClient.get("ShopAPI/BuyItem"):InvokeServer("pets", "cracked_egg", { buy_count = 1 }) end)
+end
+-- equip a pet/egg to grow. equipped + still growing -> leave it. grown (age 6) -> swap.
 local function ensurePetEquipped()
     local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
     local cur = (okE and type(eq) == "table") and eq[1] or nil
-    local okW, wr = pcall(function() return EquippedPets.get_my_equipped_char_wrappers() end)
-    local hasChar = okW and type(wr) == "table" and #wr > 0
-    if cur and hasChar and petAge(cur) < PET_MAX_AGE then return true end
+    if cur and petAge(cur) < PET_MAX_AGE then return true end                       -- growing -> leave it
     if cur and petAge(cur) >= PET_MAX_AGE then pcall(function() ClientToolManager.unequip(cur) end); task.wait(1) end
     local pick = pickYoungestPet(cur and cur.unique) or pickYoungestPet(nil)
+    if not pick then
+        if buyCrackedEgg() then task.wait(1.5); pick = pickYoungestPet(nil) end     -- nothing to grow -> buy one
+    end
     if pick then pcall(function() ClientToolManager.equip(pick) end); task.wait(2); return true end
     return false
 end
@@ -261,7 +278,6 @@ local function ailmentStillActive(kind, wrapper)
     return false
 end
 
--- robust: get back into the house, verify, retry with both methods
 local function returnHome()
     for _ = 1, 4 do
         if isInHouse() then return true end
@@ -277,6 +293,7 @@ end
 -- ============================================================
 -- FIX HANDLERS
 -- ============================================================
+-- furniture: re-fire the use each cycle (retry) until done or timeout
 local function fixFurnitureAilment(kind, wrapper)
     local pos
     pcall(function() pos = AFH.find_furniture_position(kind) end)
@@ -296,11 +313,10 @@ local function fixFurnitureAilment(kind, wrapper)
     park(); task.wait(1)
     local action = FNA.new({ ailment_to_boost = kind })
     if not action:get_valid_interaction() then return false, "no interaction in range" end
-    pcall(function() action:automatically_use_nearby_furniture(wrapper) end)
     local waited = 0
     while farming and waited < FIX_TIMEOUT do
+        if waited % 8 == 0 then pcall(function() action:automatically_use_nearby_furniture(wrapper) end) end   -- retry the action
         task.wait(2); waited = waited + 2
-        -- only re-park if something drifted off (don't interrupt an in-progress use)
         local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
         local dDrift = (myRoot and myRoot.Parent) and (myRoot.Position - target).Magnitude or 0
         local pr = isPet and ailingChar and ailingChar:FindFirstChild("HumanoidRootPart")
@@ -310,6 +326,56 @@ local function fixFurnitureAilment(kind, wrapper)
     end
     pcall(function() action:stop() end)
     return false, "timeout after " .. waited .. "s"
+end
+
+-- ============================================================
+-- BABY FEED (free hospital food): grab (if needed) -> equip -> eat, retry until clear
+-- ============================================================
+local function findFoodItem(kind)
+    local match = FEED_MATCH[kind]
+    if not match then return nil end
+    local f = (ClientData.get("inventory") or {}).food or {}
+    for u, it in pairs(f) do
+        if type(it) == "table" and it.kind and match(it.kind) then it.unique = it.unique or u; return it end
+    end
+    return nil
+end
+local function grabFreeFood(kind)   -- must be at the Hospital shop; BuyItem is free (cost 0)
+    local grabKind = FEED_GRAB[kind]
+    if not grabKind then return false end
+    local done, res = false, false
+    task.spawn(function()
+        local ok, r = pcall(function() return RouterClient.get("ShopAPI/BuyItem"):InvokeServer("food", grabKind, { buy_count = 1 }) end)
+        res = ok and (r == "success"); done = true
+    end)
+    local t = 0; while not done and t < 5 do task.wait(0.25); t = t + 0.25 end
+    return res
+end
+local function eatFood(item, wrapper)
+    pcall(function() ClientToolManager.equip(item) end); task.wait(1)
+    if _okUIH and UseItemHelper then pcall(function() UseItemHelper.use_item(wrapper, item) end) end
+    pcall(function() UIManager.apps.FocusPetApp:feed_pet(item) end)
+    pcall(function() RouterClient.get("PetAPI/ConsumeFoodObject"):FireServer(item.unique) end)   -- fallback
+end
+local function fixBabyFeed(a)
+    local kind = a.kind
+    local item = findFoodItem(kind)
+    local traveled = false
+    if not item then   -- none in inventory -> go to hospital and grab free
+        pcall(function() InteriorsM.enter_smooth("Hospital", "MainDoor", {}) end); task.wait(3); traveled = true
+        for _ = 1, 5 do if grabFreeFood(kind) then break end; task.wait(0.4) end
+        item = findFoodItem(kind)
+    end
+    if not item then if traveled then returnHome() end; return false, "no free " .. kind .. " food" end
+    local waited = 0
+    while farming and waited < FIX_TIMEOUT do
+        eatFood(item, a.wrapper)
+        task.wait(3); waited = waited + 3
+        if not ailmentStillActive(kind, a.wrapper) then if traveled then returnHome() end; return true, "fed free (" .. tostring(item.kind) .. ")" end
+        item = findFoodItem(kind) or item   -- grab a fresh one if the last got consumed
+    end
+    if traveled then returnHome() end
+    return false, kind .. " feed timeout"
 end
 
 local function fixPetMe(a)
@@ -383,7 +449,6 @@ local function fixRide(a)
     return fixMove(a)
 end
 
--- travel task: enter_smooth to destination -> move/wait -> return home
 local function fixTravel(a)
     local d = TRAVEL_DEST[a.kind]
     if not d then return false, "no dest" end
@@ -412,10 +477,11 @@ local function tryFixAilment(a)
     elseif AILMENT_MOVE[a.kind] then return fixMove(a)
     elseif AILMENT_FURNITURE[a.kind] then return fixFurnitureAilment(a.kind, a.wrapper)
     elseif AILMENT_FEED[a.kind] then
-        -- pets eat/drink from bowls (furniture); babies need a food ITEM which we
-        -- don't have a free source for yet -> skip baby feed instead of wasting trips.
-        if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end
-        return false, "baby feed skipped (needs food item)"
+        if a.tag == "pet" then
+            if a.kind == "hungry" or a.kind == "thirsty" then return fixFurnitureAilment(a.kind, a.wrapper) end
+            return false, "pet " .. a.kind .. " no handler"
+        end
+        return fixBabyFeed(a)   -- baby: free hospital food
     end
     return false, "no handler"
 end
@@ -424,7 +490,10 @@ local function isHandled(a)
     if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
-    if AILMENT_FEED[a.kind] then return a.tag == "pet" end   -- baby feed not handled (skipped)
+    if AILMENT_FEED[a.kind] then
+        if a.tag == "pet" then return a.kind == "hungry" or a.kind == "thirsty" end
+        return true
+    end
     return false
 end
 
@@ -464,9 +533,7 @@ local function claimExtras()
     tryRemote("HousingAPI/ClaimAllDeliveries"); tryRemote("LootBoxAPI/ClaimLoginHandouts")
 end
 local function fillPetPen()
-    -- correct key is idle_progression_manager (was idle_progression -> always nil,
-    -- which made this think the pen was empty and spam AddPet for penned pets)
-    local penData = ClientData.get("idle_progression_manager") or {}
+    local penData = ClientData.get("idle_progression_manager") or {}   -- correct key
     local activePets = penData.active_pets or {}
     local count = 0; for _ in pairs(activePets) do count = count + 1 end
     if count >= 4 then return end
@@ -474,14 +541,8 @@ local function fillPetPen()
     local added = 0
     for unique, it in pairs(pets) do
         if count + added >= 4 then break end
-        if isRealPet(it) and not activePets[unique] and petAge(it) >= PET_MAX_AGE then
+        if type(it) == "table" and it.kind and not isEgg(it.kind) and not activePets[unique] and petAge(it) >= PET_MAX_AGE then
             RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1)
-        end
-    end
-    if count + added < 4 then
-        for unique, it in pairs(pets) do
-            if count + added >= 4 then break end
-            if isRealPet(it) and not activePets[unique] then RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1) end
         end
     end
 end
@@ -573,22 +634,19 @@ end
 task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
 
 -- ============================================================
--- ENSURE IN HOUSE (robust: respawn-home first, then smooth enter, then exit as last resort)
+-- ENSURE IN HOUSE
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return true end
     setFarmStatus("Recovering to house...")
     for _ = 1, 6 do
         if isInHouse() then return true end
-        -- proven method first: force respawn at home (works even when floating in the world)
         pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "recover" }) end)
         task.wait(2.5)
         if isInHouse() then return true end
-        -- smooth enter into own house
         pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
         local t = 0
         while t < 6 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
-        -- last resort: leave whatever interior we're stuck in, then retry
         pcall(function() InteriorsM.exit_smooth() end); task.wait(1.5)
     end
     return isInHouse()
