@@ -1,7 +1,7 @@
 --[[
     AutoScript - AutoTrade + AutoFarm + AutoEgg
     Ailment fixing via native FurnitureNavigationAction. Self-healing cooldowns.
-    Anti-AFK included. Baby feed disabled (pets use bowls).
+    Anti-AFK. Baby feed disabled. Robust house recovery (skips work while in the void).
 --]]
 
 local Players     = game:GetService("Players")
@@ -38,8 +38,8 @@ local WEBHOOK_SECRET = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
 
 local FARM_LOOP_INTERVAL = 0.5
 local MONEYTREE_EVERY    = 600
-local FIX_TIMEOUT        = 30   -- give a fix up to 30s
-local COOLDOWN           = 60   -- if it fails/stalls, skip that need for 60s
+local FIX_TIMEOUT        = 30
+local COOLDOWN           = 60
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true, sick = true }
 local AILMENT_FEED = { hungry = true, thirsty = true }  -- pets use bowl; baby feed disabled
@@ -175,7 +175,6 @@ local function getCharWrappers()
     end
     return wrappers
 end
--- returns list of { kind, progress, wrapper, tag, obj }
 local function getActiveAilments()
     local results = {}
     for _, entry in ipairs(getCharWrappers()) do
@@ -208,7 +207,7 @@ local function ailmentStillActive(kind, wrapper)
 end
 
 -- ============================================================
--- FURNITURE AILMENT FIX (native FurnitureNavigationAction)
+-- FURNITURE AILMENT FIX
 -- ============================================================
 local function fixFurnitureAilment(kind, wrapper)
     local pos
@@ -249,7 +248,6 @@ local function fixFurnitureAilment(kind, wrapper)
     return false, "timeout after " .. waited .. "s"
 end
 
--- dispatcher: returns ok, info
 local function tryFixAilment(a)
     if a.kind == "pet_me" then
         local petChar
@@ -263,7 +261,7 @@ local function tryFixAilment(a)
     elseif AILMENT_FURNITURE[a.kind] then
         return fixFurnitureAilment(a.kind, a.wrapper)
     elseif AILMENT_FEED[a.kind] then
-        if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end  -- pet: bowl
+        if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end
         return false, "baby feed disabled"
     end
     return false, "no handler"
@@ -272,7 +270,7 @@ end
 local function isHandled(a)
     if a.kind == "pet_me" then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
-    if AILMENT_FEED[a.kind] then return a.tag == "pet" end  -- pet bowls only; baby feed off
+    if AILMENT_FEED[a.kind] then return a.tag == "pet" end
     return false
 end
 
@@ -352,7 +350,6 @@ local function getEggCounts()
     for _, item in pairs(pets) do if item.kind and item.kind:find("egg") then counts[item.kind] = (counts[item.kind] or 0) + 1 end end
     return counts
 end
--- baby/pet ailment breakdown for the dashboard
 local function buildAilmentLists()
     local baby, pet = {}, {}
     for _, entry in ipairs(getCharWrappers()) do
@@ -413,7 +410,7 @@ end
 task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
 
 -- ============================================================
--- ENSURE IN HOUSE
+-- ENSURE IN HOUSE (robust recovery from void/limbo)
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return true end
@@ -590,16 +587,16 @@ function startFarm()
             if loopCount % 60 == 0 then pcall(claimExtras) end
             local char = LocalPlayer.Character
             local root = char and char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local inHouse = ensureInHouse(setFarmStatus)
-                dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
-                if not inHouse then
-                    setFarmStatus("Stuck outside house, retrying...", Color3.fromRGB(255,200,0))
-                    task.wait(2)
-                elseif true then
+            if not root then
+                setFarmStatus("No character", Color3.fromRGB(255,200,0))
+            elseif not ensureInHouse(setFarmStatus) then
+                dbgInHouse = false; dbgFurniture = countFurniture()
+                setFarmStatus("Stuck outside house, retrying...", Color3.fromRGB(255,200,0))
+                task.wait(2)
+            else
                 pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
                 task.wait(0.2)
-                    end
+                dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
                 if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
                 if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
                 local ailments = getActiveAilments()
@@ -631,8 +628,6 @@ function startFarm()
                         end
                     end
                 end
-            else
-                setFarmStatus("No character", Color3.fromRGB(255,200,0))
             end
             task.wait(FARM_LOOP_INTERVAL)
         end
