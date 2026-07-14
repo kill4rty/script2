@@ -1,7 +1,8 @@
 --[[
-    AutoScript - AutoTrade + AutoFarm + AutoEgg
-    Ailment fixing via native FurnitureNavigationAction. Self-healing cooldowns.
-    Anti-AFK. Baby feed disabled. Robust house recovery (skips work while in the void).
+    AutoScript - AutoFarm + AutoTrade + AutoEgg
+    Ailments: baby+pet furniture (FNA), pet_me (FocusPet+performance), mystery (choose),
+    walk/ride (RateMovement). Auto-equips + grows pets. Anti-AFK. Self-healing cooldowns.
+    Travel-based tasks (sick/food/pizza/camping/balloon_fight) not yet handled.
 --]]
 
 local Players     = game:GetService("Players")
@@ -11,38 +12,43 @@ local RS          = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
--- Anti-AFK: reset the idle timer so Roblox won't disconnect after ~20 min
+-- Anti-AFK
 LocalPlayer.Idled:Connect(function()
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
+    pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
 end)
 
 local Fsys = require(RS:WaitForChild("Fsys")).load
-local RouterClient       = Fsys("RouterClient")
-local ClientData         = Fsys("ClientData")
-local AilmentsClient     = Fsys("new:AilmentsClient")
-local EquippedPets       = Fsys("EquippedPets")
-local CharWrapperClient  = Fsys("CharWrapperClient")
+local RouterClient      = Fsys("RouterClient")
+local ClientData        = Fsys("ClientData")
+local AilmentsClient    = Fsys("new:AilmentsClient")
+local EquippedPets      = Fsys("EquippedPets")
+local CharWrapperClient = Fsys("CharWrapperClient")
+local ClientToolManager = Fsys("ClientToolManager")
+local UIManager         = Fsys("UIManager")
+local PetEntityHelper   = Fsys("PetEntityHelper")
+local _okPPN, PetPerformanceName = pcall(Fsys, "PetPerformanceName")
 
 local FNA = require(RS.new.modules.Ailments.ClientActions.FurnitureNavigationAction)
 local AFH = require(RS.new.modules.Ailments.Helpers.AilmentsFurnitureHelper)
+local PetEntityManager = require(RS.ClientModules.Game.PetEntities.PetEntityManager)
 
 -- ============================================================
 -- CONFIG
 -- ============================================================
 local SERVER_URL     = "http://152.53.144.174:5000"
 local INSTANCE_ID    = LocalPlayer.Name
-local WEBHOOK_SECRET = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
+local WEBHOOK_SECRET  = "7f3a9c2e5b8d1064a2e7c9f04b6d8135"
 
 local FARM_LOOP_INTERVAL = 0.5
 local MONEYTREE_EVERY    = 600
-local FIX_TIMEOUT        = 30
-local COOLDOWN           = 60
+local FIX_TIMEOUT        = 30   -- furniture fix time budget
+local MOVE_TIME          = 34   -- walk/ride movement duration (RateMovement total_time is 30)
+local COOLDOWN           = 60   -- skip a failed need for this long
+local PET_MAX_AGE        = 6    -- Full Grown = skip/rotate
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true, sick = true }
-local AILMENT_FEED = { hungry = true, thirsty = true }  -- pets use bowl; baby feed disabled
+local AILMENT_FEED = { hungry = true, thirsty = true }  -- pet: bowl; baby: disabled
+local AILMENT_MOVE = { walk = true, play = true }       -- RateMovement: move around
 
 local startFarm, stopFarm, startEgg, stopEgg
 local usernameBox, totalEggsBox, startTradeBtn
@@ -70,7 +76,6 @@ local function countFurniture()
     end
     return 0
 end
-
 local function isInHouse()
     local ok, IM = pcall(Fsys, "InteriorsM")
     if not ok or not IM then return false end
@@ -154,6 +159,41 @@ local function waitForConfirmationStage(tradeId)
 end
 
 -- ============================================================
+-- PETS: equip youngest non-adult, skip pen pets, rotate at Full Grown
+-- ============================================================
+local function petAge(item) return (item and item.properties and item.properties.age) or 99 end
+local function getPenUniques()
+    local set = {}
+    local pen = ClientData.get("idle_progression") or {}
+    for u in pairs(pen.active_pets or {}) do set[u] = true end
+    return set
+end
+local function pickYoungestPet(exclude)
+    local pen = getPenUniques()
+    local pets = (ClientData.get("inventory") or {}).pets or {}
+    local best, bestAge
+    for u, it in pairs(pets) do
+        if type(it) == "table" and not pen[u] and u ~= exclude then
+            it.unique = it.unique or u
+            local age = petAge(it)
+            if age < PET_MAX_AGE and (not best or age < bestAge) then best, bestAge = it, age end
+        end
+    end
+    return best
+end
+local function ensurePetEquipped()
+    local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
+    local cur = (okE and type(eq) == "table") and eq[1] or nil
+    local okW, wr = pcall(function() return EquippedPets.get_my_equipped_char_wrappers() end)
+    local hasChar = okW and type(wr) == "table" and #wr > 0
+    if cur and hasChar and petAge(cur) < PET_MAX_AGE then return true end
+    if cur and petAge(cur) >= PET_MAX_AGE then pcall(function() ClientToolManager.unequip(cur) end); task.wait(1) end
+    local pick = pickYoungestPet(cur and cur.unique) or pickYoungestPet(nil)
+    if pick then pcall(function() ClientToolManager.equip(pick) end); task.wait(2); return true end
+    return false
+end
+
+-- ============================================================
 -- WRAPPERS / AILMENTS
 -- ============================================================
 local function getBabyWrapper()
@@ -207,8 +247,9 @@ local function ailmentStillActive(kind, wrapper)
 end
 
 -- ============================================================
--- FURNITURE AILMENT FIX
+-- FIX HANDLERS
 -- ============================================================
+-- furniture (baby or pet): position ailing char on furniture, native FNA use
 local function fixFurnitureAilment(kind, wrapper)
     local pos
     pcall(function() pos = AFH.find_furniture_position(kind) end)
@@ -218,57 +259,114 @@ local function fixFurnitureAilment(kind, wrapper)
     elseif typeof(pos) == "CFrame" then target = pos.Position
     elseif type(pos) == "table" and pos.Position then target = pos.Position end
     if not target then return false, "bad furniture pos" end
-
     local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     local ailingChar = wrapper and wrapper.char
     local isPet = ailingChar and ailingChar ~= LocalPlayer.Character
     local function park()
         if myRoot then myRoot.CFrame = CFrame.new(target + Vector3.new(0, 3, 0)) end
-        if isPet then
-            local pr = ailingChar:FindFirstChild("HumanoidRootPart")
-            if pr then pr.CFrame = CFrame.new(target + Vector3.new(2.5, 3, 0)) end
-        end
+        if isPet then local pr = ailingChar:FindFirstChild("HumanoidRootPart"); if pr then pr.CFrame = CFrame.new(target + Vector3.new(2.5, 3, 0)) end end
     end
     park(); task.wait(1)
-
     local action = FNA.new({ ailment_to_boost = kind })
     if not action:get_valid_interaction() then return false, "no interaction in range" end
     pcall(function() action:automatically_use_nearby_furniture(wrapper) end)
-
     local waited = 0
     while farming and waited < FIX_TIMEOUT do
-        task.wait(2); waited = waited + 2
-        park()
-        if not ailmentStillActive(kind, wrapper) then
-            pcall(function() action:stop() end)
-            return true, "fixed in " .. waited .. "s"
-        end
+        task.wait(2); waited = waited + 2; park()
+        if not ailmentStillActive(kind, wrapper) then pcall(function() action:stop() end); return true, "fixed in " .. waited .. "s" end
     end
     pcall(function() action:stop() end)
     return false, "timeout after " .. waited .. "s"
 end
 
+-- pet_me: focus pet -> stage Petting performance -> fire completion
+local function fixPetMe(a)
+    local pu, pchar = a.wrapper.pet_unique, a.wrapper.char
+    if not pu or not pchar then return false, "no pet unique/char" end
+    pcall(function() RouterClient.get("AdoptAPI/FocusPet"):FireServer(pchar) end)
+    task.wait(0.4)
+    local entity
+    local ok, ents = pcall(function() return PetEntityManager.get_local_owned_pet_entities() end)
+    if ok and type(ents) == "table" then for _, e in pairs(ents) do if e.base and e.base.char_wrapper and e.base.char_wrapper.pet_unique == pu then entity = e break end end end
+    local pname = (_okPPN and PetPerformanceName and PetPerformanceName.Petting) or "Petting"
+    if entity then pcall(function() PetEntityHelper.stage_performance(entity, { name = pname, options = { ailment_kind = "pet_me" } }) end) end
+    task.wait(2.5)
+    pcall(function() RouterClient.get("PetAPI/PetPetted"):FireServer(pu, LocalPlayer) end)
+    pcall(function() RouterClient.get("AilmentsAPI/ProgressPetMeAilment"):FireServer(pu) end)
+    local w = 0
+    while farming and w < 8 do task.wait(1); w = w + 1; if not ailmentStillActive("pet_me", a.wrapper) then break end end
+    if entity then pcall(function() PetEntityHelper.end_performance(entity, pname) end) end
+    pcall(function() RouterClient.get("AdoptAPI/UnfocusPet"):FireServer(pchar) end)
+    return not ailmentStillActive("pet_me", a.wrapper), "petted"
+end
+
+-- mystery: roll slots, choose a fixable one -> becomes a real need
+local function fixMystery(a)
+    local action = a.obj.action
+    if not action or not action._get_ailment_slots then return false, "no mystery action" end
+    local ok, slots = pcall(function() return action:_get_ailment_slots(a.wrapper) end)
+    if not ok or type(slots) ~= "table" then return false, "no slots" end
+    local FIXABLE = { sleepy=true, dirty=true, toilet=true, thirsty=true, walk=true, pet_me=true }
+    local idx, kind
+    for i, k in pairs(slots) do if FIXABLE[k] then idx, kind = i, k break end end
+    if not idx then for i, k in pairs(slots) do idx, kind = i, k break end end
+    if not idx then return false, "no slot" end
+    pcall(function() RouterClient.get("AilmentsAPI/ChooseMysteryAilment"):FireServer(a.wrapper.pet_unique, action.options.ailment_key, idx, kind) end)
+    task.wait(1.5)
+    return not ailmentStillActive("mystery", a.wrapper), "chose " .. tostring(kind)
+end
+
+-- walk/play: RateMovement -> move the ailing char (and player) around
+local function fixMove(a)
+    local ailChar = (a.wrapper and a.wrapper.char) or LocalPlayer.Character
+    local root = ailChar and ailChar:FindFirstChild("HumanoidRootPart")
+    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return false, "no root" end
+    local origin = root.Position
+    local startT, i = tick(), 0
+    while farming and tick() - startT < MOVE_TIME do
+        i = i + 1
+        local off = Vector3.new(math.cos(i * 0.4) * 5, 0, math.sin(i * 0.4) * 5)
+        root.CFrame = CFrame.new(origin + off)
+        if myRoot and myRoot ~= root then myRoot.CFrame = CFrame.new(origin + off + Vector3.new(2.5, 0, 0)) end
+        task.wait(0.2)
+        if not ailmentStillActive(a.kind, a.wrapper) then return true, "moved" end
+    end
+    return not ailmentStillActive(a.kind, a.wrapper), "move timeout"
+end
+
+-- ride: equip a stroller/transport (valid state) then move (RateMovement, ~30s)
+local function fixRide(a)
+    local inv = ClientData.get("inventory") or {}
+    local item
+    for _, cat in ipairs({ "strollers", "transport" }) do
+        local items = inv[cat]
+        if items then for u, it in pairs(items) do it.unique = it.unique or u; item = it break end end
+        if item then break end
+    end
+    if not item then return false, "no stroller/transport item" end
+    task.spawn(function() pcall(function() a.obj:do_action(a.wrapper) end) end)
+    task.wait(1.5)
+    pcall(function() UIManager.apps.BackpackApp:try_pick_item(item) end)
+    task.wait(1.5)
+    return fixMove(a)
+end
+
 local function tryFixAilment(a)
-    if a.kind == "pet_me" then
-        local petChar
-        for _, e in ipairs(getCharWrappers()) do if e.tag == "pet" and e.w.char then petChar = e.w.char; break end end
-        if petChar then
-            pcall(function() RouterClient.get("PetAPI/PetPetted"):FireServer(petChar) end)
-            pcall(function() RouterClient.get("AilmentsAPI/ProgressPetMeAilment"):FireServer() end)
-        end
-        task.wait(1)
-        return not ailmentStillActive(a.kind, a.wrapper), "petted"
-    elseif AILMENT_FURNITURE[a.kind] then
-        return fixFurnitureAilment(a.kind, a.wrapper)
+    if a.kind == "pet_me" then return fixPetMe(a)
+    elseif a.kind == "mystery" then return fixMystery(a)
+    elseif a.kind == "ride" then return fixRide(a)
+    elseif AILMENT_MOVE[a.kind] then return fixMove(a)
+    elseif AILMENT_FURNITURE[a.kind] then return fixFurnitureAilment(a.kind, a.wrapper)
     elseif AILMENT_FEED[a.kind] then
         if a.tag == "pet" then return fixFurnitureAilment(a.kind, a.wrapper) end
         return false, "baby feed disabled"
     end
-    return false, "no handler"
+    return false, "no handler (travel/other)"
 end
-
 local function isHandled(a)
-    if a.kind == "pet_me" then return true end
+    if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" then return true end
+    if AILMENT_MOVE[a.kind] then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
     if AILMENT_FEED[a.kind] then return a.tag == "pet" end
     return false
@@ -314,12 +412,20 @@ local function fillPetPen()
     local activePets = penData.active_pets or {}
     local count = 0; for _ in pairs(activePets) do count = count + 1 end
     if count >= 4 then return end
-    local inventory = ClientData.get("inventory") or {}
-    local pets = inventory.pets or {}
+    -- prefer Full Grown pets for the pen (passive income); leave young ones to equip/grow
+    local pets = (ClientData.get("inventory") or {}).pets or {}
     local added = 0
-    for unique, _ in pairs(pets) do
+    for unique, it in pairs(pets) do
         if count + added >= 4 then break end
-        if not activePets[unique] then RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1) end
+        if type(it) == "table" and not activePets[unique] and petAge(it) >= PET_MAX_AGE then
+            RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1)
+        end
+    end
+    if count + added < 4 then
+        for unique, it in pairs(pets) do
+            if count + added >= 4 then break end
+            if type(it) == "table" and not activePets[unique] then RouterClient.get("IdleProgressionAPI/AddPet"):FireServer(unique); added = added + 1; task.wait(0.1) end
+        end
     end
 end
 local function claimMoneyTree()
@@ -410,7 +516,7 @@ end
 task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
 
 -- ============================================================
--- ENSURE IN HOUSE (robust recovery from void/limbo)
+-- ENSURE IN HOUSE
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return true end
@@ -597,6 +703,7 @@ function startFarm()
                 pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
                 task.wait(0.2)
                 dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
+                pcall(ensurePetEquipped)
                 if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
                 if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
                 local ailments = getActiveAilments()
