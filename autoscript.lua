@@ -216,10 +216,20 @@ local function pickYoungestPet(exclude)
     end
     return best
 end
+-- rate-limited shop purchase: never fire ShopAPI/BuyItem calls closer than SHOP_MIN_GAP apart.
+-- (stops the getProductInfo 429 "Too Many Requests" flood that comes from spamming the shop.)
+local _lastShop = 0
+local SHOP_MIN_GAP = 2.5
+local function shopBuy(cat, kind, opts)
+    local gap = SHOP_MIN_GAP - (tick() - _lastShop)
+    if gap > 0 then task.wait(gap) end
+    _lastShop = tick()
+    return RouterClient.get("ShopAPI/BuyItem"):InvokeServer(cat, kind, opts or { buy_count = 1 })
+end
 local function buyCrackedEgg()
     local money = ClientData.get("money") or 0
     if money < MIN_BUCKS_FOR_EGG then return false end
-    return pcall(function() RouterClient.get("ShopAPI/BuyItem"):InvokeServer("pets", "cracked_egg", { buy_count = 1 }) end)
+    return pcall(function() return shopBuy("pets", "cracked_egg") end)
 end
 -- equip a pet/egg to grow. equipped + still growing -> leave it. grown (age 6) -> swap.
 -- keep A pet equipped for farming: if any real pet is already out, LEAVE it (no age-6 rotation
@@ -366,7 +376,7 @@ local function grabFreeFood(kind)   -- must be at the Hospital shop; BuyItem is 
     if not grabKind then return false end
     local done, res = false, false
     task.spawn(function()
-        local ok, r = pcall(function() return RouterClient.get("ShopAPI/BuyItem"):InvokeServer("food", grabKind, { buy_count = 1 }) end)
+        local ok, r = pcall(function() return shopBuy("food", grabKind) end)
         res = ok and (r == "success"); done = true
     end)
     local t = 0; while not done and t < 5 do task.wait(0.25); t = t + 0.25 end
@@ -987,7 +997,7 @@ function stopEgg()
 end
 function startEgg()
     local interval = tonumber(eggIntervalBox.Text) or 30
-    if interval < 1 then interval = 1 end
+    if interval < 3 then interval = 3 end   -- floor to avoid hammering the shop (429s)
     local eggKind = EGG_BUY_OPTIONS[selectedEggBuyIndex].kind
     local eggCategory = EGG_BUY_OPTIONS[selectedEggBuyIndex].category
     eggBuying = true; currentMode = "egg"; eggBoughtCount = 0
@@ -996,7 +1006,7 @@ function startEgg()
     eggThread = task.spawn(function()
         while eggBuying do
             currentStatus = "egg (bought " .. eggBoughtCount .. ")"
-            local ok, err = pcall(function() RouterClient.get("ShopAPI/BuyItem"):InvokeServer(eggCategory, eggKind, { buy_count = 1 }) end)
+            local ok, err = pcall(function() return shopBuy(eggCategory, eggKind) end)
             if ok then eggBoughtCount = eggBoughtCount + 1; eggBoughtLabel.Text = "Bought: " .. eggBoughtCount; setEggStatus("Bought! Total: " .. eggBoughtCount)
             else setEggStatus("Failed: " .. tostring(err):sub(1,30), Color3.fromRGB(255,200,0)); logErr("buyEgg", err) end
             task.wait(interval)
