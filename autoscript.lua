@@ -77,11 +77,13 @@ local TRAVEL_DEST = {
 }
 -- MAINMAP SPOT tasks: enter MainMap -> teleport to a specific StaticMap part -> STAY there
 -- (RateArea server component only ticks while your char is at the spot, ~50s). {area, targetPart, radius}
+-- {area, targetPart, radius}. Teleport to the part the ailment's is_in_area check measures FROM
+-- (the AilmentTarget/Origin), not the nav target - beach_party's nav target sits outside its perimeter.
 local MAP_SPOT = {
-    beach_party   = { "Beach",        "BeachPartyNavTarget", 550 },
-    camping       = { "Campsite",     "CampsiteOrigin",      100 },
-    balloon_fight = { "BalloonFight",  "FortDagi",           100 },
-    bored         = { "Park",         "BoredAilmentTarget",  100 },
+    beach_party   = { "Beach",        "BeachPartyAilmentTarget", 550 },
+    camping       = { "Campsite",     "CampsiteOrigin",          100 },
+    balloon_fight = { "BalloonFight",  "FortDagi",               100 },
+    bored         = { "Park",         "BoredAilmentTarget",      100 },
 }
 
 local startFarm, stopFarm, startEgg, stopEgg
