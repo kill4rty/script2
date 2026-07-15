@@ -889,7 +889,7 @@ function startFarm()
         while farming do
             local lok, lerr = pcall(function()
                 loopCount = loopCount + 1
-                if loopCount % 60 == 0 then pcall(claimExtras) end
+                if loopCount % 60 == 0 then task.spawn(function() pcall(claimExtras) end) end
                 local char = LocalPlayer.Character
                 local root = char and char:FindFirstChild("HumanoidRootPart")
                 if not root then
@@ -899,12 +899,14 @@ function startFarm()
                     setFarmStatus("Stuck outside house, retrying...", Color3.fromRGB(255,200,0))
                     task.wait(2)
                 else
-                    pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end)
+                    -- all of these can YIELD (streaming / RemoteFunction InvokeServer). Run them
+                    -- fire-and-forget so a hang can never freeze the ailment loop.
+                    task.spawn(function() pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end) end)
                     task.wait(0.2)
                     dbgInHouse = isInHouse(); dbgFurniture = countFurniture()
-                    pcall(ensurePetEquipped)
-                    if loopCount % 60 == 0 then pcall(claimPetPen); pcall(fillPetPen) end
-                    if loopCount % MONEYTREE_EVERY == 0 then pcall(claimMoneyTree) end
+                    task.spawn(function() pcall(ensurePetEquipped) end)
+                    if loopCount % 60 == 0 then task.spawn(function() pcall(claimPetPen); pcall(fillPetPen) end) end
+                    if loopCount % MONEYTREE_EVERY == 0 then task.spawn(function() pcall(claimMoneyTree) end) end
                     local ailments = getActiveAilments()
                     if #ailments == 0 then
                         setFarmStatus("All happy!"); ailmentLabel.Text = ""
