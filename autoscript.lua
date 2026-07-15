@@ -68,14 +68,20 @@ local FEED_MATCH = {
         and not k:find("potion") and not k:find("bait") and not k:find("rod") and not k:find("temporary") end,
 }
 
--- travel tasks: enter_smooth(dest, door) -> wait -> return home  (sick handled by feed, not here)
+-- INTERIOR travel tasks: enter_smooth(dest, door) -> wait in the interior -> return home.
+-- (being inside the interior satisfies these; sick handled by feed, not here)
 local TRAVEL_DEST = {
     pizza_party   = { dest = "PizzaShop", door = "MainDoor" },
     school        = { dest = "School",    door = "MainDoor" },
     salon         = { dest = "Salon",     door = "MainDoor" },
-    camping       = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
-    balloon_fight = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
-    beach_party   = { dest = "MainMap",   door = "Neighborhood/MainDoor" },
+}
+-- MAINMAP SPOT tasks: enter MainMap -> teleport to a specific StaticMap part -> STAY there
+-- (RateArea server component only ticks while your char is at the spot, ~50s). {area, targetPart, radius}
+local MAP_SPOT = {
+    beach_party   = { "Beach",        "BeachPartyNavTarget", 550 },
+    camping       = { "Campsite",     "CampsiteOrigin",      100 },
+    balloon_fight = { "BalloonFight",  "FortDagi",           100 },
+    bored         = { "Park",         "BoredAilmentTarget",  100 },
 }
 
 local startFarm, stopFarm, startEgg, stopEgg
@@ -94,7 +100,7 @@ local dbgFurniture  = -1
 local dbgInHouse    = false
 local eggBoughtCount = 0
 local ailmentCooldown = {}
-local ailmentAttempts = {}   -- per-ailment fail count -> give up after 2
+local ailmentAttempts = {}   -- per-ailment fail count -> give up after 2 (only if NO progress)
 
 local function logErr(where, err) lastError = tostring(where) .. ": " .. tostring(err):sub(1, 160) end
 local function countFurniture()
@@ -279,6 +285,15 @@ local function ailmentStillActive(kind, wrapper)
     end
     return false
 end
+local function ailmentProgress(kind, wrapper)   -- current progress (0..1); 1 if gone
+    local ok, ailments = pcall(function() return AilmentsClient.get_ailments_for_pet(wrapper) end)
+    if ok and ailments then
+        for _, a in pairs(ailments) do
+            if a.kind == kind then return a.get_progress and a:get_progress() or (a.progress or 0) end
+        end
+    end
+    return 1
+end
 
 local function returnHome()
     for _ = 1, 4 do
@@ -353,15 +368,18 @@ local function grabFreeFood(kind)   -- must be at the Hospital shop; BuyItem is 
     local t = 0; while not done and t < 5 do task.wait(0.25); t = t + 0.25 end
     return res
 end
--- baby self-eat: equip the food (spawns a GenericTool) and ACTIVATE it (= clicking while
--- holding), which fires the game's own consume handler. NOT feed_pet (that's a pet call).
-local function eatFood(item, wrapper)
-    pcall(function() ClientToolManager.equip(item) end); task.wait(1.2)
-    local char = LocalPlayer.Character
-    local tool = char and char:FindFirstChildWhichIsA("Tool")
-    if tool then
-        for _ = 1, 4 do pcall(function() tool:Activate() end); task.wait(0.5) end
-    end
+-- baby self-eat (CONFIRMED via ToolDBHelper decompile): the food is a GenericTool; firing
+-- ToolAPI/ServerUseTool(unique,"START") then (unique,"END") runs the server's generic_server_use_end
+-- which does AilmentsServer.add_progress(wrapper, ailment, 1/uses). So each START/END cycle adds ~1/uses.
+-- (This is the "Feed Me" path; NOT feed_pet, which is pet-only and dead for babies.)
+local function serverUseTool(unique, phase)
+    local done = false
+    task.spawn(function() pcall(function() RouterClient.get("ToolAPI/ServerUseTool"):InvokeServer(unique, phase) end); done = true end)
+    local t = 0; while not done and t < 3 do task.wait(0.25); t = t + 0.25 end
+end
+local function eatOnce(item)
+    serverUseTool(item.unique, "START"); task.wait(1)
+    serverUseTool(item.unique, "END");   task.wait(0.6)
 end
 local function fixBabyFeed(a)
     local kind = a.kind
@@ -373,38 +391,41 @@ local function fixBabyFeed(a)
         item = findFoodItem(kind)
     end
     if not item then if traveled then returnHome() end; return false, "no free " .. kind .. " food" end
-    local waited = 0
-    while farming and waited < FIX_TIMEOUT do
-        eatFood(item, a.wrapper)
-        task.wait(3); waited = waited + 3
+    pcall(function() ClientToolManager.equip(item) end); task.wait(1)
+    -- fire START/END uses until the ailment is satisfied (each use adds ~1/uses progress)
+    local n = 0
+    while farming and n < 14 do
+        n = n + 1
+        item = findFoodItem(kind) or item   -- item may get consumed / unique may change
+        if not item then break end
+        eatOnce(item)
         if not ailmentStillActive(kind, a.wrapper) then
             pcall(function() ClientToolManager.unequip(item) end)   -- free the slot so the pet re-equips
             if traveled then returnHome() end
-            return true, "fed free (" .. tostring(item.kind) .. ")"
+            return true, "fed free (" .. tostring(kind) .. ", " .. n .. " uses)"
         end
-        item = findFoodItem(kind) or item   -- grab a fresh one if the last got consumed
     end
     pcall(function() ClientToolManager.unequip(item) end)
     if traveled then returnHome() end
     return false, kind .. " feed timeout"
 end
 
+-- pet_me (PET ailment): the real satisfy (from AilmentsDB.pet_me create_action) is
+-- FocusPetApp.petting_handler:start_petting() on the focused pet. (Not PetPetted/ProgressPetMeAilment.)
 local function fixPetMe(a)
-    local pu, pchar = a.wrapper.pet_unique, a.wrapper.char
-    if not pu or not pchar then return false, "no pet unique/char" end
+    local pchar = a.wrapper.char
+    if not pchar then return false, "no pet char" end
     pcall(function() RouterClient.get("AdoptAPI/FocusPet"):FireServer(pchar) end)
-    task.wait(0.4)
-    local entity
-    local ok, ents = pcall(function() return PetEntityManager.get_local_owned_pet_entities() end)
-    if ok and type(ents) == "table" then for _, e in pairs(ents) do if e.base and e.base.char_wrapper and e.base.char_wrapper.pet_unique == pu then entity = e break end end end
-    local pname = (_okPPN and PetPerformanceName and PetPerformanceName.Petting) or "Petting"
-    if entity then pcall(function() PetEntityHelper.stage_performance(entity, { name = pname, options = { ailment_kind = "pet_me" } }) end) end
-    task.wait(2.5)
-    pcall(function() RouterClient.get("PetAPI/PetPetted"):FireServer(pu, LocalPlayer) end)
-    pcall(function() RouterClient.get("AilmentsAPI/ProgressPetMeAilment"):FireServer(pu) end)
+    task.wait(0.5)
+    local ph = UIManager.apps.FocusPetApp.petting_handler
+    pcall(function() ph:show_example() end)
+    pcall(function() ph:start_petting() end)
     local w = 0
-    while farming and w < 8 do task.wait(1); w = w + 1; if not ailmentStillActive("pet_me", a.wrapper) then break end end
-    if entity then pcall(function() PetEntityHelper.end_performance(entity, pname) end) end
+    while farming and w < 12 do
+        task.wait(1); w = w + 1
+        if not ailmentStillActive("pet_me", a.wrapper) then break end
+        if w % 4 == 0 then pcall(function() ph:start_petting() end) end   -- re-trigger if still going
+    end
     pcall(function() RouterClient.get("AdoptAPI/UnfocusPet"):FireServer(pchar) end)
     return not ailmentStillActive("pet_me", a.wrapper), "petted"
 end
@@ -444,20 +465,52 @@ local function fixMove(a)
     return not ailmentStillActive(a.kind, a.wrapper), "move timeout"
 end
 
+-- ride: UseItemHelper.use_item(babyWrapper, strollerItem) -> the strollers handler does
+-- backpack_equip({chars_to_sit={wrapper}}) + AdoptAPI/UseStroller (sits the baby), then move.
+local _okUIH2, UseItemHelperRide = pcall(function() return require(RS.new.modules.Ailments.Helpers.UseItemHelper) end)
 local function fixRide(a)
     local inv = ClientData.get("inventory") or {}
     local item
     for _, cat in ipairs({ "strollers", "transport" }) do
         local items = inv[cat]
-        if items then for u, it in pairs(items) do it.unique = it.unique or u; item = it break end end
+        if items then for u, it in pairs(items) do it.unique = it.unique or u; it.category = it.category or cat; item = it break end end
         if item then break end
     end
     if not item then return false, "no stroller/transport item" end
-    task.spawn(function() pcall(function() a.obj:do_action(a.wrapper) end) end)
-    task.wait(1.5)
-    pcall(function() UIManager.apps.BackpackApp:try_pick_item(item) end)
-    task.wait(1.5)
-    return fixMove(a)
+    if _okUIH2 and UseItemHelperRide then pcall(function() UseItemHelperRide.use_item(a.wrapper, item) end) end
+    task.wait(2)   -- let the baby get seated in the stroller
+    return fixMove(a)   -- then move it around for the ride duration
+end
+
+-- MainMap spot task: enter MainMap, stream in + find the StaticMap target part, teleport onto
+-- it and hold there while the RateArea ticks (~50s), then return home.
+local function fixMapSpot(a)
+    local spec = MAP_SPOT[a.kind]
+    if not spec then return false, "no map spot" end
+    pcall(function() InteriorsM.enter_smooth("MainMap", "Neighborhood/MainDoor", {}) end)
+    task.wait(4)
+    local target
+    for _ = 1, 10 do
+        local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if root then pcall(function() LocalPlayer:RequestStreamAroundAsync(root.Position) end) end
+        local sm = workspace:FindFirstChild("StaticMap")
+        local area = sm and sm:FindFirstChild(spec[1])
+        target = area and area:FindFirstChild(spec[2])
+        if target then break end
+        task.wait(1)
+    end
+    if not target then returnHome(); return false, "no " .. a.kind .. " target streamed" end
+    local pos = target.Position
+    local waited, i = 0, 0
+    while farming and waited < TRAVEL_TIME do
+        i = i + 1
+        local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if root and root.Parent then root.CFrame = CFrame.new(pos + Vector3.new(math.cos(i * 0.5) * 4, 4, math.sin(i * 0.5) * 4)) end
+        task.wait(2); waited = waited + 2
+        if not ailmentStillActive(a.kind, a.wrapper) then returnHome(); return true, a.kind .. " at spot (" .. waited .. "s)" end
+    end
+    returnHome()
+    return false, a.kind .. " spot timeout"
 end
 
 local function fixTravel(a)
@@ -484,6 +537,7 @@ local function tryFixAilment(a)
     if a.kind == "pet_me" then return fixPetMe(a)
     elseif a.kind == "mystery" then return fixMystery(a)
     elseif a.kind == "ride" then return fixRide(a)
+    elseif MAP_SPOT[a.kind] then return fixMapSpot(a)
     elseif TRAVEL_DEST[a.kind] then return fixTravel(a)
     elseif AILMENT_MOVE[a.kind] then return fixMove(a)
     elseif AILMENT_FURNITURE[a.kind] then return fixFurnitureAilment(a.kind, a.wrapper)
@@ -498,6 +552,7 @@ local function tryFixAilment(a)
 end
 local function isHandled(a)
     if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" then return true end
+    if MAP_SPOT[a.kind] then return true end
     if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
@@ -864,13 +919,21 @@ function startFarm()
                                 setFarmStatus("Fixed: " .. fixable.kind)
                             else
                                 logErr("fix " .. fixable.kind, info)   -- only real failures go to last_error
-                                ailmentAttempts[key] = (ailmentAttempts[key] or 0) + 1
-                                if ailmentAttempts[key] >= 2 then
-                                    ailmentCooldown[key] = os.time() + 300   -- 2 tries failed -> give up, move on
-                                    setFarmStatus("Gave up " .. fixable.kind .. " (2 tries)", Color3.fromRGB(255,150,0))
+                                -- if the ailment actually made progress, DON'T give up - keep going
+                                local afterProg = ailmentProgress(fixable.kind, fixable.wrapper)
+                                if afterProg > (fixable.progress or 0) + 0.001 then
+                                    ailmentAttempts[key] = nil               -- progressing -> reset the counter
+                                    ailmentCooldown[key] = os.time() + 2     -- retry almost immediately
+                                    setFarmStatus("Progressing " .. fixable.kind .. " (" .. math.floor(afterProg * 100) .. "%)")
                                 else
-                                    ailmentCooldown[key] = os.time() + 5     -- quick retry for the 2nd try
-                                    setFarmStatus("Retry " .. fixable.kind .. " (try " .. ailmentAttempts[key] .. ")", Color3.fromRGB(255,200,0))
+                                    ailmentAttempts[key] = (ailmentAttempts[key] or 0) + 1
+                                    if ailmentAttempts[key] >= 2 then
+                                        ailmentCooldown[key] = os.time() + 300   -- 2 tries, no progress -> give up, move on
+                                        setFarmStatus("Gave up " .. fixable.kind .. " (2 tries, no progress)", Color3.fromRGB(255,150,0))
+                                    else
+                                        ailmentCooldown[key] = os.time() + 5     -- quick retry for the 2nd try
+                                        setFarmStatus("Retry " .. fixable.kind .. " (try " .. ailmentAttempts[key] .. ")", Color3.fromRGB(255,200,0))
+                                    end
                                 end
                             end
                         end
