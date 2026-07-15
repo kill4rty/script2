@@ -883,7 +883,17 @@ function startFarm()
     farming = true; currentMode = "farm"
     farmBtn.Text = "Stop AutoFarm"; farmBtn.BackgroundColor3 = Color3.fromRGB(170,60,60)
     setFarmStatus("Starting..."); lastError = ""
-    becomeBaby(); fillPetPen(); claimPetPen(); claimMoneyTree(); claimExtras()
+    -- get into the house and settle FIRST, THEN become a baby + equip a pet, THEN the rest.
+    -- (becoming a baby before being home seems to interfere with the pet equipping.)
+    task.spawn(function()
+        ensureInHouse(setFarmStatus)
+        task.wait(1.5)
+        becomeBaby()
+        task.wait(2)
+        pcall(ensurePetEquipped)
+        task.wait(1)
+        pcall(fillPetPen); pcall(claimPetPen); pcall(claimMoneyTree); pcall(claimExtras)
+    end)
     local loopCount = 0
     farmThread = task.spawn(function()
         while farming do
