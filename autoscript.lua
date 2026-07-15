@@ -201,6 +201,8 @@ local function getPenUniques()
     return set
 end
 -- youngest thing to grow: any pet OR egg, not in pen, under age 6 (egg vs pet - no difference)
+-- youngest free pet to equip. An egg IS a pet (has ailments; species just undecided), so no
+-- egg/pet distinction - just take the youngest of ANY age that isn't in the pen.
 local function pickYoungestPet(exclude)
     local pen = getPenUniques()
     local pets = (ClientData.get("inventory") or {}).pets or {}
@@ -209,7 +211,7 @@ local function pickYoungestPet(exclude)
         if type(it) == "table" and it.kind and not pen[u] and u ~= exclude then
             it.unique = it.unique or u
             local age = petAge(it)
-            if age < PET_MAX_AGE and (not best or age < bestAge) then best, bestAge = it, age end
+            if not best or age < bestAge then best, bestAge = it, age end
         end
     end
     return best
@@ -220,14 +222,16 @@ local function buyCrackedEgg()
     return pcall(function() RouterClient.get("ShopAPI/BuyItem"):InvokeServer("pets", "cracked_egg", { buy_count = 1 }) end)
 end
 -- equip a pet/egg to grow. equipped + still growing -> leave it. grown (age 6) -> swap.
+-- keep A pet equipped for farming: if any real pet is already out, LEAVE it (no age-6 rotation
+-- that used to leave you petless). If none, equip the youngest free pet; buy a cracked egg only
+-- when there's genuinely nothing to equip.
 local function ensurePetEquipped()
     local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
     local cur = (okE and type(eq) == "table") and eq[1] or nil
-    if cur and petAge(cur) < PET_MAX_AGE then return true end                       -- growing -> leave it
-    if cur and petAge(cur) >= PET_MAX_AGE then pcall(function() ClientToolManager.unequip(cur) end); task.wait(1) end
-    local pick = pickYoungestPet(cur and cur.unique) or pickYoungestPet(nil)
+    if cur and petAge(cur) < 99 then return true end   -- a pet is already equipped (any age) -> leave it
+    local pick = pickYoungestPet(nil)
     if not pick then
-        if buyCrackedEgg() then task.wait(1.5); pick = pickYoungestPet(nil) end     -- nothing to grow -> buy one
+        if buyCrackedEgg() then task.wait(1.5); pick = pickYoungestPet(nil) end     -- nothing to equip -> buy one
     end
     if pick then pcall(function() ClientToolManager.equip(pick) end); task.wait(2); return true end
     return false
