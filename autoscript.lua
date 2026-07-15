@@ -201,14 +201,14 @@ local function getPenUniques()
     return set
 end
 -- youngest thing to grow: any pet OR egg, not in pen, under age 6 (egg vs pet - no difference)
--- youngest free pet to equip. An egg IS a pet (has ailments; species just undecided), so no
--- egg/pet distinction - just take the youngest of ANY age that isn't in the pen.
+-- youngest free pet to equip. Eggs ARE pets (they have needs/ailments and hatch as you fill them),
+-- so egg or hatched = no difference. ONLY skip the practice_dog (tutorial pet that can't be equipped).
 local function pickYoungestPet(exclude)
     local pen = getPenUniques()
     local pets = (ClientData.get("inventory") or {}).pets or {}
     local best, bestAge
     for u, it in pairs(pets) do
-        if type(it) == "table" and it.kind and not pen[u] and u ~= exclude then
+        if type(it) == "table" and it.kind and not pen[u] and u ~= exclude and not it.kind:find("practice") then
             it.unique = it.unique or u
             local age = petAge(it)
             if not best or age < bestAge then best, bestAge = it, age end
@@ -238,8 +238,12 @@ end
 local function ensurePetEquipped()
     local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
     local cur = (okE and type(eq) == "table") and eq[1] or nil
-    if cur and petAge(cur) < 99 then return true end   -- a pet is already equipped (any age) -> leave it
-    local pick = pickYoungestPet(nil)
+    -- a real pet/egg already equipped (not the un-equippable practice_dog) -> leave it out
+    if cur and cur.kind and petAge(cur) < 99 and not cur.kind:find("practice") then
+        return true
+    end
+    -- nothing, or practice_dog stuck -> equip a real pet (exclude current so we swap it)
+    local pick = pickYoungestPet(cur and cur.unique) or pickYoungestPet(nil)
     if not pick then
         if buyCrackedEgg() then task.wait(1.5); pick = pickYoungestPet(nil) end     -- nothing to equip -> buy one
     end
