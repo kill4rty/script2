@@ -477,9 +477,16 @@ end
 -- so wandering never works. Needs an actual toy tool (ChewToy/FlyingDisc/ThrowToy/SqueakyToy)
 -- used near the pet. NO auto-buy - if there's no toy in inventory we skip (won't spend bucks).
 local PLAY_TOY_TOOLS = { ChewToyTool = true, FlyingDiscTool = true, ThrowToyTool = true, SqueakyToyTool = true }
+local function isPlayToy(it)   -- mirror the ailment's own filter_callback (checks .tool against the 4 valid toys)
+    if type(it) ~= "table" then return false end
+    return PLAY_TOY_TOOLS[it.tool] or (it.kind and PLAY_TOY_TOOLS[it.kind]) or false
+end
 local function findToy()
     local toys = (ClientData.get("inventory") or {}).toys or {}
-    for u, it in pairs(toys) do
+    for u, it in pairs(toys) do   -- prefer a real, filter-valid play toy
+        if isPlayToy(it) then it.unique = it.unique or u; return it end
+    end
+    for u, it in pairs(toys) do   -- fallback: any toy in the category
         if type(it) == "table" and it.kind then it.unique = it.unique or u; return it end
     end
     return nil
@@ -490,11 +497,11 @@ local function fixPlay(a)
     local pchar = a.wrapper and a.wrapper.char
     local uses = 0
     while farming and uses < 14 do
+        -- keep the pet next to you so it can fetch the thrown toy
         local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
         local pr = pchar and pchar:FindFirstChild("HumanoidRootPart")
-        if myRoot and pr then pcall(function() pr.CFrame = myRoot.CFrame * CFrame.new(3, 0, 0) end) end  -- pet next to you to fetch
-        if _okUIH and UseItemHelper then pcall(function() UseItemHelper.use_item(a.wrapper, toy) end) end  -- proper item-use
-        serverUseTool(toy.unique, "START"); task.wait(1); serverUseTool(toy.unique, "END"); task.wait(1)   -- throw/use fallback
+        if myRoot and pr then pcall(function() pr.CFrame = myRoot.CFrame * CFrame.new(3, 0, 0) end) end
+        eatOnce(toy)   -- throw = same inventory-bar server-use as eating food (ServerUseTool START/END)
         uses = uses + 1
         if not ailmentStillActive("play", a.wrapper) then return true, "played x" .. uses end
         toy = findToy() or toy
