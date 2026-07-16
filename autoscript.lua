@@ -238,11 +238,15 @@ local function buyCrackedEgg()
     if money < MIN_BUCKS_FOR_EGG then return false end
     return shopBuy("pets", "cracked_egg", { buy_count = 1 }) ~= nil
 end
--- keep a real (non-practice) pet equipped so it grows. no pet -> equip youngest -> else buy cracked egg.
+-- keep a still-GROWING pet equipped so its tasks age it; once it hits age 6, swap it out
+-- (so fillPetPen can pen the grown one) and equip the next youngest. This cycles pets to age 6.
 local function ensurePetEquipped()
     local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
     local cur = (okE and type(eq) == "table") and eq[1] or nil
-    if cur and cur.kind and not tostring(cur.kind):find("practice") then return true end   -- real pet equipped -> leave it
+    if cur and cur.kind and not tostring(cur.kind):find("practice") and petAge(cur) < PET_MAX_AGE then
+        return true                                                                        -- still growing -> keep aging it
+    end
+    if cur and cur.unique then pcall(function() ClientToolManager.unequip(cur) end); task.wait(1) end  -- grown/practice -> free it
     local pick = pickYoungestPet(cur and cur.unique)
     if not pick then
         if buyCrackedEgg() then task.wait(1.5); pick = pickYoungestPet(nil) end            -- nothing to grow -> buy one
@@ -581,7 +585,10 @@ local function tryFixAilment(a)
     return false, "no handler"
 end
 local function isHandled(a)
-    if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" or a.kind == "play" then return true end
+    -- pet_me intentionally NOT handled: its progress is gated behind the real hold-and-drag petting
+    -- minigame with server-side validation (ProgressPetMeAilment is rejected without it). Skipping it
+    -- so the farm doesn't waste cycles; the pet still ages via its other tasks.
+    if a.kind == "mystery" or a.kind == "ride" or a.kind == "play" then return true end
     if MAP_SPOT[a.kind] then return true end
     if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
