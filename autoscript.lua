@@ -60,15 +60,15 @@ local SHOP_MIN_GAP       = 2.5  -- min seconds between ShopAPI/BuyItem calls (42
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true }
 local AILMENT_FEED = { hungry = true, thirsty = true, sick = true }  -- baby: eat free food; pet: bowl (hungry/thirsty)
-local AILMENT_MOVE = { walk = true, play = true }
+local AILMENT_MOVE = { walk = true }   -- play handled separately (needs a real toy, not wandering)
 
 -- baby feed: free grab kind + which inventory kinds satisfy each ailment
 local FEED_GRAB = { hungry = "schospital_refresh_2023_cafeteria_sandwich", thirsty = "water", sick = "healing_apple" }
+-- ONLY match the exact free/restockable kind for each ailment (never eat the user's own stock)
 local FEED_MATCH = {
-    thirsty = function(k) return k == "water" end,
-    sick    = function(k) return k == "healing_apple" end,
-    hungry  = function(k) return k ~= "water" and k ~= "healing_apple"
-        and not k:find("potion") and not k:find("bait") and not k:find("rod") and not k:find("temporary") end,
+    thirsty = function(k) return k == FEED_GRAB.thirsty end,
+    sick    = function(k) return k == FEED_GRAB.sick end,
+    hungry  = function(k) return k == FEED_GRAB.hungry end,
 }
 
 -- INTERIOR travel tasks: enter_smooth(dest, door) -> wait in the interior -> return home.
@@ -473,6 +473,35 @@ local function fixRide(a)
     return fixMove(a)
 end
 
+-- play (PET only; not_for_babies/not_for_eggs): no passive server tick (empty server_components),
+-- so wandering never works. Needs an actual toy tool (ChewToy/FlyingDisc/ThrowToy/SqueakyToy)
+-- used near the pet. NO auto-buy - if there's no toy in inventory we skip (won't spend bucks).
+local PLAY_TOY_TOOLS = { ChewToyTool = true, FlyingDiscTool = true, ThrowToyTool = true, SqueakyToyTool = true }
+local function findToy()
+    local toys = (ClientData.get("inventory") or {}).toys or {}
+    for u, it in pairs(toys) do
+        if type(it) == "table" and it.kind then it.unique = it.unique or u; return it end
+    end
+    return nil
+end
+local function fixPlay(a)
+    local toy = findToy()
+    if not toy then return false, "no toy in inventory (play needs a toy; not auto-buying)" end
+    local pchar = a.wrapper and a.wrapper.char
+    local uses = 0
+    while farming and uses < 14 do
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local pr = pchar and pchar:FindFirstChild("HumanoidRootPart")
+        if myRoot and pr then pcall(function() pr.CFrame = myRoot.CFrame * CFrame.new(3, 0, 0) end) end  -- pet next to you to fetch
+        if _okUIH and UseItemHelper then pcall(function() UseItemHelper.use_item(a.wrapper, toy) end) end  -- proper item-use
+        serverUseTool(toy.unique, "START"); task.wait(1); serverUseTool(toy.unique, "END"); task.wait(1)   -- throw/use fallback
+        uses = uses + 1
+        if not ailmentStillActive("play", a.wrapper) then return true, "played x" .. uses end
+        toy = findToy() or toy
+    end
+    return false, "play incomplete (" .. uses .. " uses)"
+end
+
 -- MainMap spot task: enter MainMap, stream in + find the StaticMap target part, teleport onto
 -- it and hold there while the RateArea ticks (~50s), then return home.
 local function fixMapSpot(a)
@@ -528,6 +557,7 @@ local function tryFixAilment(a)
     if a.kind == "pet_me" then return fixPetMe(a)
     elseif a.kind == "mystery" then return fixMystery(a)
     elseif a.kind == "ride" then return fixRide(a)
+    elseif a.kind == "play" then return fixPlay(a)
     elseif MAP_SPOT[a.kind] then return fixMapSpot(a)
     elseif TRAVEL_DEST[a.kind] then return fixTravel(a)
     elseif AILMENT_MOVE[a.kind] then return fixMove(a)
@@ -542,7 +572,7 @@ local function tryFixAilment(a)
     return false, "no handler"
 end
 local function isHandled(a)
-    if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" then return true end
+    if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" or a.kind == "play" then return true end
     if MAP_SPOT[a.kind] then return true end
     if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
