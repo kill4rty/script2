@@ -1034,3 +1034,14 @@ end
 startEggBtn.MouseButton1Click:Connect(function() if eggBuying then stopEgg() else startEgg() end end)
 
 switchTab("trade")
+
+-- ============================================================
+-- AUTO-START: farm by default (no manual click). Waits for the character to load, then starts
+-- the farm. Combined with Delta auto-execute, an instance self-farms on join/relaunch.
+-- ============================================================
+task.spawn(function()
+    local t = 0
+    while not LocalPlayer.Character and t < 90 do task.wait(1); t = t + 1 end
+    task.wait(6)   -- let the world/house settle
+    if not farming then pcall(startFarm) end
+end)
