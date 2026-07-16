@@ -402,24 +402,26 @@ local function fixBabyFeed(a)
     return false, kind .. " feed incomplete (" .. uses .. " uses)"
 end
 
+-- pet_me (PET ailment, not_for_babies): focus the pet, then drive the FocusPetApp petting_handler
+-- (show_example + start_petting) - the confirmed clear. No passive server tick (empty server_components).
 local function fixPetMe(a)
-    local pu, pchar = a.wrapper.pet_unique, a.wrapper.char
-    if not pu or not pchar then return false, "no pet unique/char" end
+    local pchar = a.wrapper and a.wrapper.char
+    if not pchar then return false, "no pet char" end
     pcall(function() RouterClient.get("AdoptAPI/FocusPet"):FireServer(pchar) end)
-    task.wait(0.4)
-    local entity
-    local ok, ents = pcall(function() return PetEntityManager.get_local_owned_pet_entities() end)
-    if ok and type(ents) == "table" then for _, e in pairs(ents) do if e.base and e.base.char_wrapper and e.base.char_wrapper.pet_unique == pu then entity = e break end end end
-    local pname = (_okPPN and PetPerformanceName and PetPerformanceName.Petting) or "Petting"
-    if entity then pcall(function() PetEntityHelper.stage_performance(entity, { name = pname, options = { ailment_kind = "pet_me" } }) end) end
-    task.wait(2.5)
-    pcall(function() RouterClient.get("PetAPI/PetPetted"):FireServer(pu, LocalPlayer) end)
-    pcall(function() RouterClient.get("AilmentsAPI/ProgressPetMeAilment"):FireServer(pu) end)
+    task.wait(0.5)
+    local ph = UIManager.apps.FocusPetApp.petting_handler
+    if not ph then pcall(function() RouterClient.get("AdoptAPI/UnfocusPet"):FireServer(pchar) end); return false, "no petting_handler" end
+    pcall(function() ph:show_example() end)
+    pcall(function() ph:start_petting() end)
     local w = 0
-    while farming and w < 8 do task.wait(1); w = w + 1; if not ailmentStillActive("pet_me", a.wrapper) then break end end
-    if entity then pcall(function() PetEntityHelper.end_performance(entity, pname) end) end
+    while farming and w < 12 do
+        task.wait(1.5); w = w + 1
+        if not ailmentStillActive("pet_me", a.wrapper) then break end
+        pcall(function() ph:start_petting() end)   -- keep petting until it clears
+    end
+    local done = not ailmentStillActive("pet_me", a.wrapper)
     pcall(function() RouterClient.get("AdoptAPI/UnfocusPet"):FireServer(pchar) end)
-    return not ailmentStillActive("pet_me", a.wrapper), "petted"
+    return done, done and "petted" or "pet_me timeout"
 end
 
 local function fixMystery(a)
@@ -457,20 +459,20 @@ local function fixMove(a)
     return not ailmentStillActive(a.kind, a.wrapper), "move timeout"
 end
 
+-- ride: UseItemHelper.use_item(babyWrapper, strollerItem) -> the strollers handler runs
+-- backpack_equip({chars_to_sit={wrapper}}) + AdoptAPI/UseStroller (actually sits the baby), then move.
 local function fixRide(a)
     local inv = ClientData.get("inventory") or {}
     local item
     for _, cat in ipairs({ "strollers", "transport" }) do
         local items = inv[cat]
-        if items then for u, it in pairs(items) do it.unique = it.unique or u; item = it break end end
+        if items then for u, it in pairs(items) do it.unique = it.unique or u; it.category = it.category or cat; item = it break end end
         if item then break end
     end
     if not item then return false, "no stroller/transport item" end
-    task.spawn(function() pcall(function() a.obj:do_action(a.wrapper) end) end)
-    task.wait(1.5)
-    pcall(function() UIManager.apps.BackpackApp:try_pick_item(item) end)
-    task.wait(1.5)
-    return fixMove(a)
+    if _okUIH and UseItemHelper then pcall(function() UseItemHelper.use_item(a.wrapper, item) end) end
+    task.wait(2)        -- let the baby get seated in the stroller
+    return fixMove(a)   -- then move it around for the ride duration
 end
 
 -- play (PET only; not_for_babies/not_for_eggs): no passive server tick (empty server_components),
