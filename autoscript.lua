@@ -108,6 +108,7 @@ local progressTracker = {}   -- key -> { progress, since }; how long each task h
 local stuckReport     = nil  -- once "STUCK:<kind>", persists and is reported until the instance restarts
 local moneyLog    = {}       -- recent per-task earnings, newest first ("+15 play")
 local moneyEarned = 0        -- running total of bucks earned this run
+local farmStartTime = 0      -- os.time() when the farm started (for uptime)
 local function addMoneyLog(task, amount)
     moneyEarned = moneyEarned + amount
     table.insert(moneyLog, 1, "+" .. amount .. " " .. task)
@@ -774,6 +775,7 @@ local function sendStatus()
     pcall(function()
         local body = { instance_id = INSTANCE_ID, secret = WEBHOOK_SECRET, username = LocalPlayer.Name,
             job_id = game.JobId, bucks = ClientData.get("money") or 0, eggs = getEggCounts(),
+            farm_uptime = (farmStartTime > 0) and (os.time() - farmStartTime) or 0,
             status = stuckReport or currentStatus, mode = currentMode, error = lastError }
         if debugEnabled then body.debug = buildDebug() end
         local response = HttpService:RequestAsync({ Url = SERVER_URL .. "/update", Method = "POST",
@@ -967,6 +969,7 @@ function stopFarm()
 end
 function startFarm()
     farming = true; currentMode = "farm"
+    if farmStartTime == 0 then farmStartTime = os.time() end   -- start the uptime clock (once)
     farmBtn.Text = "Stop AutoFarm"; farmBtn.BackgroundColor3 = Color3.fromRGB(170,60,60)
     setFarmStatus("Starting..."); lastError = ""
     -- get into the house and settle FIRST, THEN become a baby + equip a pet, THEN the rest.
