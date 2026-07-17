@@ -54,7 +54,7 @@ local TRAVEL_TIME        = 56
 local COOLDOWN           = 20   -- shorter so failed fixes retry sooner (retry-until-done)
 local STUCK_LIMIT        = 300  -- handled non-pet_me task with NO progress for 5 min => report STUCK (watchdog restarts)
 local PET_MAX_AGE        = 6
-local MIN_BUCKS_FOR_EGG  = 1000 -- only auto-buy a cracked egg (350) if you have at least this much
+local MIN_BUCKS_FOR_EGG  = 350  -- buy a cracked egg (costs 350) as soon as the account can afford one
 
 local AILMENT_FURNITURE = { sleepy = true, dirty = true, toilet = true }
 local AILMENT_FEED = { hungry = true, thirsty = true, sick = true }  -- baby: eat free food; pet: bowl (hungry/thirsty)
@@ -222,7 +222,7 @@ local function pickYoungestPet(exclude)
     local pets = (ClientData.get("inventory") or {}).pets or {}
     local best, bestAge
     for u, it in pairs(pets) do
-        if type(it) == "table" and it.kind and not pen[u] and u ~= exclude and not it.kind:find("practice") then
+        if type(it) == "table" and it.kind and not pen[u] and u ~= exclude and not it.kind:find("practice") and not it.kind:find("starter") then
             it.unique = it.unique or u
             local age = petAge(it)
             if not best or age < bestAge then best, bestAge = it, age end
@@ -252,7 +252,7 @@ end
 local function ensurePetEquipped()
     local okE, eq = pcall(function() return EquippedPets.get_my_equipped() end)
     local cur = (okE and type(eq) == "table") and eq[1] or nil
-    local curReal = cur and cur.kind and not cur.kind:find("practice")
+    local curReal = cur and cur.kind and not cur.kind:find("practice") and not cur.kind:find("starter")
     -- still-GROWING real pet equipped -> leave it aging
     if curReal and petAge(cur) < PET_MAX_AGE then return true end
     -- grown real pet equipped: swap to a younger one ONLY if one exists (never go petless), so the
@@ -636,7 +636,10 @@ local function tryFixAilment(a)
     return false, "no handler"
 end
 local function isHandled(a)
-    if a.kind == "pet_me" or a.kind == "mystery" or a.kind == "ride" or a.kind == "play" then return true end
+    -- pet_me & play SKIPPED: pet_me's capture_focus disables controls (cripples later fixes) and never
+    -- confirmed to clear; play's toy path just wastes throws. Both are time-sinks - leave them so the
+    -- farm spends its cycles on the fast, reliable ailments that actually earn.
+    if a.kind == "mystery" or a.kind == "ride" then return true end
     if MAP_SPOT[a.kind] then return true end
     if TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
