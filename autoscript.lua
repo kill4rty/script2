@@ -22,6 +22,26 @@ LocalPlayer.Idled:Connect(function()
     pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
 end)
 
+-- RENDER TRIM: kill the expensive render bits (shadows, post-effects, atmosphere, lighting quality)
+-- WITHOUT disabling rendering itself - so streaming still works and the farm can still find furniture.
+-- Reasserted periodically in case Adopt Me resets them. This is the safe CPU cut; it never touches
+-- Set3dRenderingEnabled (which breaks streaming).
+task.spawn(function()
+    while true do
+        pcall(function()
+            local L = game:GetService("Lighting")
+            L.GlobalShadows = false
+            L.FogEnd = 9e9
+            for _, e in ipairs(L:GetDescendants()) do
+                if e:IsA("PostEffect") or e:IsA("Atmosphere") or e:IsA("Clouds") then e.Enabled = false end
+            end
+            pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+            pcall(function() game:GetService("Players").LocalPlayer.DevComputerCameraMode = Enum.DevComputerCameraMovementMode.Classic end)
+        end)
+        task.wait(30)
+    end
+end)
+
 local Fsys = require(RS:WaitForChild("Fsys")).load
 local RouterClient      = Fsys("RouterClient")
 local ClientData        = Fsys("ClientData")
@@ -838,8 +858,10 @@ end)
 -- ============================================================
 local function ensureInHouse(setFarmStatus)
     if isInHouse() then return true end
-    setFarmStatus("Recovering to house...")
-    for _ = 1, 6 do
+    if setFarmStatus then setFarmStatus("Recovering to house...") end
+    for attempt = 1, 6 do
+        if isInHouse() then return true end
+        pcall(function() InteriorsM.exit_smooth() end); task.wait(1)   -- leave whatever interior we're stuck in FIRST
         if isInHouse() then return true end
         pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "recover" }) end)
         task.wait(2.5)
@@ -847,7 +869,16 @@ local function ensureInHouse(setFarmStatus)
         pcall(function() InteriorsM.enter_smooth("housing", "MainDoor", { house_owner = LocalPlayer }) end)
         local t = 0
         while t < 6 do task.wait(0.5); t = t + 0.5; if isInHouse() then return true end end
-        pcall(function() InteriorsM.exit_smooth() end); task.wait(1.5)
+        -- stubbornly stuck (attempt 3+): reset the character so it respawns at home, then re-spawn home
+        if attempt >= 3 then
+            pcall(function()
+                local h = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA("Humanoid")
+                if h then h.Health = 0 end
+            end)
+            task.wait(4)
+            pcall(function() RouterClient.get("TeamAPI/Spawn"):InvokeServer("home", { source_for_logging = "recover_reset" }) end)
+            task.wait(2)
+        end
     end
     return isInHouse()
 end
