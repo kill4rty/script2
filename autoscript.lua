@@ -106,6 +106,13 @@ local ailmentCooldown = {}
 local ailmentAttempts = {}   -- per-ailment fail count -> give up after 2 (only if NO progress)
 local progressTracker = {}   -- key -> { progress, since }; how long each task has sat without progress
 local stuckReport     = nil  -- once "STUCK:<kind>", persists and is reported until the instance restarts
+local moneyLog    = {}       -- recent per-task earnings, newest first ("+15 play")
+local moneyEarned = 0        -- running total of bucks earned this run
+local function addMoneyLog(task, amount)
+    moneyEarned = moneyEarned + amount
+    table.insert(moneyLog, 1, "+" .. amount .. " " .. task)
+    while #moneyLog > 15 do table.remove(moneyLog) end
+end
 
 local function logErr(where, err) lastError = tostring(where) .. ": " .. tostring(err):sub(1, 160) end
 local function countFurniture()
@@ -721,6 +728,34 @@ local function buildAilmentLists()
     end
     return table.concat(baby, ", "), table.concat(pet, ", ")
 end
+-- summarize the whole inventory: per category, count by kind (pets also show age: kind(a<age>))
+local function buildInventory()
+    local inv = ClientData.get("inventory") or {}
+    local cats = {}
+    for cat, items in pairs(inv) do
+        if type(items) == "table" then
+            local counts, n = {}, 0
+            for _, it in pairs(items) do
+                if type(it) == "table" and it.kind then
+                    local label = it.kind
+                    if cat == "pets" then
+                        local age = it.properties and it.properties.age
+                        if age then label = it.kind .. "(a" .. tostring(age) .. ")" end
+                    end
+                    counts[label] = (counts[label] or 0) + 1; n = n + 1
+                end
+            end
+            if n > 0 then
+                local parts = {}
+                for label, c in pairs(counts) do table.insert(parts, c .. "x " .. label) end
+                table.sort(parts)
+                table.insert(cats, cat .. " [" .. n .. "]: " .. table.concat(parts, ", "))
+            end
+        end
+    end
+    table.sort(cats)
+    return table.concat(cats, "  ||  ")
+end
 local function buildDebug()
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -731,7 +766,9 @@ local function buildDebug()
     if okE and eq and eq[1] then eqp = tostring(eq[1].kind) .. " a" .. tostring(eq[1].properties and eq[1].properties.age) end
     return { team = tostring(ClientData.get("team")), has_char = char ~= nil, char_pos = pos,
         in_house = dbgInHouse, furniture = dbgFurniture, task = currentStatus, egg_bought = eggBoughtCount,
-        equipped_pet = eqp, baby_ailments = babyA, pet_ailments = petA, last_fixed = lastFixed, last_error = lastError }
+        equipped_pet = eqp, baby_ailments = babyA, pet_ailments = petA, inventory = buildInventory(),
+        earned_total = moneyEarned, money_log = table.concat(moneyLog, "  |  "),
+        last_fixed = lastFixed, last_error = lastError }
 end
 local function sendStatus()
     pcall(function()
@@ -1003,11 +1040,14 @@ function startFarm()
                         else
                             setFarmStatus("Fixing: " .. (fixable.tag or "?") .. " " .. fixable.kind)
                             local key = (fixable.tag or "?") .. ":" .. fixable.kind
+                            local moneyBefore = ClientData.get("money") or 0
                             local pok, r1, r2 = pcall(tryFixAilment, fixable)
                             local ok = pok and r1 or false
                             local info = pok and r2 or ("err: " .. tostring(r1))
                             if ok then
                                 lastFixed = fixable.kind .. " (" .. tostring(info) .. ")"
+                                local gained = (ClientData.get("money") or 0) - moneyBefore
+                                if gained > 0 then addMoneyLog(fixable.kind, gained) end
                                 ailmentAttempts[key] = nil
                                 setFarmStatus("Fixed: " .. fixable.kind)
                             else
