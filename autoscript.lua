@@ -94,6 +94,7 @@ local usernameBox, totalEggsBox, startTradeBtn
 -- STATE / DEBUG
 -- ============================================================
 local farming, trading, eggBuying = false, false, false
+local lastLoopTime = 0   -- os.time() of the last farm-loop tick; heartbeat stops if this goes stale (frozen client)
 local currentMode   = "idle"
 local currentStatus = "idle"
 local debugEnabled  = true   -- always on (no toggle)
@@ -802,7 +803,19 @@ local function sendStatus()
         end
     end)
 end
-task.spawn(function() while true do task.wait(5); pcall(sendStatus) end end)
+task.spawn(function()
+    while true do
+        task.wait(5)
+        -- If the farm loop has frozen (client hung / partially crashed) while "farming", STOP sending
+        -- heartbeats so the loop goes stale and the watchdog relaunches. A legit long fix is < ~70s,
+        -- so 120s of no loop tick = genuinely stuck. Not farming / just-started => always heartbeat.
+        if farming and lastLoopTime > 0 and (os.time() - lastLoopTime) > 120 then
+            -- skip the heartbeat: let it go stale on purpose
+        else
+            pcall(sendStatus)
+        end
+    end
+end)
 
 -- ============================================================
 -- ENSURE IN HOUSE
@@ -988,6 +1001,7 @@ function startFarm()
         while farming do
             local lok, lerr = pcall(function()
                 loopCount = loopCount + 1
+                lastLoopTime = os.time()   -- proof the farm loop is actually ticking (not just the client alive)
                 if loopCount % 60 == 0 then task.spawn(function() pcall(claimExtras) end) end
                 local char = LocalPlayer.Character
                 local root = char and char:FindFirstChild("HumanoidRootPart")
