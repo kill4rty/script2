@@ -450,23 +450,36 @@ local function fixBabyFeed(a)
     return false, kind .. " feed timeout"
 end
 
--- pet_me (PET ailment): the real satisfy (from AilmentsDB.pet_me create_action) is
--- FocusPetApp.petting_handler:start_petting() on the focused pet. (Not PetPetted/ProgressPetMeAilment.)
+-- pet_me (PET ailment): the credit only fires if the FocusPetApp is actually OPENED on the pet
+-- (app:capture_focus populates the ailment list; start_petting checks it before firing the credit).
+-- So: open the care screen, then drive the petting minigame with a simulated hold+drag until it clears.
 local function fixPetMe(a)
-    local pchar = a.wrapper.char
+    local pchar = a.wrapper and a.wrapper.char
     if not pchar then return false, "no pet char" end
-    pcall(function() RouterClient.get("AdoptAPI/FocusPet"):FireServer(pchar) end)
-    task.wait(0.5)
-    local ph = UIManager.apps.FocusPetApp.petting_handler
-    pcall(function() ph:show_example() end)
-    pcall(function() ph:start_petting() end)
+    local app = UIManager.apps.FocusPetApp
+    local ph = app.petting_handler
+    -- 1) open the pet's care screen (focuses pet + fills the ailment list so progress can credit)
+    if not pcall(function() app:capture_focus(a.wrapper) end) then return false, "capture_focus failed" end
+    task.wait(1.2)
+    -- 2) drive the petting minigame: fake a moving, in-area pointer that's "held down"
+    local vp = workspace.CurrentCamera.ViewportSize * 0.5
+    ph.get_position = function() return vp + Vector2.new(math.sin(tick() * 15) * 8, math.cos(tick() * 15) * 8) end
+    ph.is_holding_pet_button = true
+    local holding = true
+    task.spawn(function() while holding do ph.is_holding_pet_button = true; task.wait(0.03) end end)
+    task.spawn(function() pcall(function() ph:start_petting("pet_me", true) end) end)   -- force_continue = true
     local w = 0
-    while farming and w < 12 do
+    while farming and w < 14 do
         task.wait(1); w = w + 1
         if not ailmentStillActive("pet_me", a.wrapper) then break end
-        if w % 4 == 0 then pcall(function() ph:start_petting() end) end   -- re-trigger if still going
+        if not ph.is_petting then task.spawn(function() pcall(function() ph:start_petting("pet_me", true) end) end) end
     end
-    pcall(function() RouterClient.get("AdoptAPI/UnfocusPet"):FireServer(pchar) end)
+    -- 3) tear down: stop holding, restore the real get_position, close the screen
+    holding = false
+    ph.is_holding_pet_button = false
+    pcall(function() ph:stop_petting() end)
+    ph.get_position = nil
+    pcall(function() app:release_focus() end)
     return not ailmentStillActive("pet_me", a.wrapper), "petted"
 end
 
