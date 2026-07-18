@@ -42,6 +42,48 @@ task.spawn(function()
     end
 end)
 
+-- EMPTY CAMERA: stare the camera at the empty sky so almost no geometry is inside the render frustum.
+-- Frustum culling => the renderer draws next to nothing, while rendering STAYS on so streaming works.
+-- The farm never uses the camera, so this is free CPU. If furniture fixes start failing with
+-- "no interaction in range" after this, set EMPTY_CAMERA = false and re-push (the game may need the camera).
+local EMPTY_CAMERA = true
+task.spawn(function()
+    while EMPTY_CAMERA do
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            if cam then
+                cam.FieldOfView = 1
+                cam.CameraType = Enum.CameraType.Scriptable
+                local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                local pos = (root and root.Position) or cam.CFrame.Position
+                cam.CFrame = CFrame.new(pos + Vector3.new(0, 300, 0)) * CFrame.Angles(math.rad(89), 0, 0)
+            end
+        end)
+        task.wait(0.5)
+    end
+end)
+
+-- RENDER_OFF (experiment): the biggest CPU cut - stop 3D rendering ENTIRELY and keep the house streamed
+-- by POSITION so the farm can still find furniture. Render-off stalls streaming for NEW areas, so when
+-- this is on the farm also SKIPS every leave-the-house task (map spots + travel + the feed's hospital run)
+-- and stays home doing furniture / feed-in-place / move / ride only.
+-- Test on ONE instance. If furniture fixes start failing ("no interaction in range"), the house isn't
+-- staying streamed with render off -> set RENDER_OFF = false and re-push.
+local RENDER_OFF = false
+if RENDER_OFF then
+    task.spawn(function()
+        local RunService = game:GetService("RunService")
+        while true do
+            pcall(function()
+                local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if root then LocalPlayer:RequestStreamAroundAsync(root.Position) end   -- keep the house loaded
+                RunService:Set3dRenderingEnabled(false)
+            end)
+            task.wait(1)
+        end
+    end)
+end
+
 local Fsys = require(RS:WaitForChild("Fsys")).load
 local RouterClient      = Fsys("RouterClient")
 local ClientData        = Fsys("ClientData")
@@ -445,8 +487,10 @@ local function fixBabyFeed(a)
     local kind = a.kind
     local item = findFoodItem(kind)
     local traveled = false
-    if not item then   -- none in inventory -> go to hospital and grab free
-        pcall(function() InteriorsM.enter_smooth("Hospital", "MainDoor", {}) end); task.wait(3); traveled = true
+    if not item then   -- none in inventory -> grab free (travel to hospital, UNLESS render is off = stay home)
+        if not RENDER_OFF then
+            pcall(function() InteriorsM.enter_smooth("Hospital", "MainDoor", {}) end); task.wait(3); traveled = true
+        end
         for _ = 1, 5 do if grabFreeFood(kind) then break end; task.wait(0.4) end
         item = findFoodItem(kind)
     end
@@ -660,8 +704,8 @@ local function isHandled(a)
     -- confirmed to clear; play's toy path just wastes throws. Both are time-sinks - leave them so the
     -- farm spends its cycles on the fast, reliable ailments that actually earn.
     if a.kind == "mystery" or a.kind == "ride" then return true end
-    if MAP_SPOT[a.kind] then return true end
-    if TRAVEL_DEST[a.kind] then return true end
+    if not RENDER_OFF and MAP_SPOT[a.kind] then return true end     -- leave-house tasks disabled when render is off
+    if not RENDER_OFF and TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
     if AILMENT_FURNITURE[a.kind] then return true end
     if AILMENT_FEED[a.kind] then
