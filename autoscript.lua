@@ -617,17 +617,26 @@ local function fixPlay(a)
     local toy = findToy()
     if not toy then return false, "no toy in inventory (play needs a toy; not auto-buying)" end
     local pchar = a.wrapper and a.wrapper.char
-    local n = 0
-    while farming and n < 14 do
-        n = n + 1
+    -- 1) EQUIP the toy so it becomes a Tool in your hand
+    pcall(function() ClientToolManager.equip(toy) end); task.wait(1.5)
+    local throws = 0
+    while farming and throws < 8 do
+        -- keep the pet right beside you so it can fetch the thrown toy
         local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
         local pr = pchar and pchar:FindFirstChild("HumanoidRootPart")
-        if myRoot and pr then pcall(function() pr.CFrame = myRoot.CFrame * CFrame.new(3, 0, 0) end) end  -- pet beside you to fetch
-        eatOnce(toy)   -- throw = same inventory-bar server-use as eating food (ServerUseTool START/END)
-        if not ailmentStillActive("play", a.wrapper) then return true, "played (" .. n .. " throws)" end
+        if myRoot and pr then pcall(function() pr.CFrame = myRoot.CFrame * CFrame.new(3, 0, 0) end) end
+        -- 2) THROW: activate the equipped Tool
+        local char = LocalPlayer.Character
+        local tool = char and char:FindFirstChildWhichIsA("Tool")
+        if tool then pcall(function() tool:Activate() end) end
+        throws = throws + 1
+        -- 3) wait for the pet to fetch it and bring it back (5-10s)
+        task.wait(8)
+        if not ailmentStillActive("play", a.wrapper) then break end
         toy = findToy() or toy
     end
-    return false, "play incomplete (" .. n .. " throws)"
+    pcall(function() ClientToolManager.unequip(toy) end)   -- put it away so it doesn't block other fixes
+    return not ailmentStillActive("play", a.wrapper), "played (" .. throws .. " throws)"
 end
 
 -- MainMap spot task: enter MainMap, stream in + find the StaticMap target part, teleport onto
@@ -703,7 +712,7 @@ local function isHandled(a)
     -- pet_me & play SKIPPED: pet_me's capture_focus disables controls (cripples later fixes) and never
     -- confirmed to clear; play's toy path just wastes throws. Both are time-sinks - leave them so the
     -- farm spends its cycles on the fast, reliable ailments that actually earn.
-    if a.kind == "mystery" or a.kind == "ride" then return true end
+    if a.kind == "mystery" or a.kind == "ride" or a.kind == "play" then return true end   -- play = toy throw (pet_me stays skipped)
     if not RENDER_OFF and MAP_SPOT[a.kind] then return true end     -- leave-house tasks disabled when render is off
     if not RENDER_OFF and TRAVEL_DEST[a.kind] then return true end
     if AILMENT_MOVE[a.kind] then return true end
