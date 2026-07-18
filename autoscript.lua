@@ -77,6 +77,16 @@ if RENDER_OFF then
             pcall(function()
                 local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                 if root then LocalPlayer:RequestStreamAroundAsync(root.Position) end   -- keep the house loaded
+                -- shrink the streaming radius so the outer world streams OUT (frees geometry RAM);
+                -- keep it big enough to cover the house so furniture stays loaded.
+                pcall(function() workspace.StreamingTargetRadius = 96 end)
+                pcall(function() workspace.StreamingMinRadius = 64 end)
+                pcall(function() workspace.StreamOutBehavior = Enum.StreamOutBehavior.Aggressive end)  -- dump out-of-range parts immediately
+                -- unload OTHER players' avatars/pets locally (big non-essential RAM in a busy server;
+                -- the farm only needs your own baby + pet). They re-replicate, so this reasserts each loop.
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= LocalPlayer and plr.Character then pcall(function() plr.Character:Destroy() end) end
+                end
                 RunService:Set3dRenderingEnabled(false)
             end)
             task.wait(1)
